@@ -468,6 +468,13 @@ again.
   `min_age`. The watermarks are deliberately *not* the documented example values: this box
   runs at ~1.5% free memory with most of RAM as page cache, so the doc's `wmarks_low=200`
   would have left DAMON permanently disabled below its own low watermark.
+  **Unproven, on purpose honest about it:** `bytes_reclaimed_regions` was still `0` at the
+  last reading, which is consistent with a 60s `min_age` plus monitoring warm-up but equally
+  consistent with it never finding anything worth reclaiming. It is shipped as *enabled*, not
+  as a *win*. The healthcheck prints the reclaimed total every run; if that stays at 0 while
+  the box is still swapping, the honest conclusion is that DAMON adds nothing here and the
+  unit's last `ExecStart` should be dropped. Cost if it does nothing is bounded by the quotas
+  (10ms of CPU per second, worst case).
 - **Docker log rotation** (50m x 3, compressed) merged into the existing `daemon.json`. The
   default json-file driver has no size cap, which on ~70 containers is a real disk-fill risk
   on the encrypted root. dockerd is deliberately *not* restarted by the updater.
