@@ -233,6 +233,15 @@ install -Dm644 /dev/stdin /etc/udev/rules.d/60-nuc16pro-ioschedulers.rules <<'UD
 @@FILE:udev/60-nuc16pro-ioschedulers.rules@@
 UDEV
 
+# Block-layer perf knobs for non-rotational devices: wbt off (ADIOS already arbitrates
+# latency, wbt is a second blind throttle on top of a smarter one) and rq_affinity=2
+# (complete on the submitting CPU, which matters on a hybrid P/E/LP-E part). Numbered 61 so
+# it lands after the elevator has been selected - switching the scheduler re-initialises
+# wbt_lat_usec, so writing it first would be undone.
+install -Dm644 /dev/stdin /etc/udev/rules.d/61-nuc16pro-blockperf.rules <<'UDEV_PERF'
+@@FILE:udev/61-nuc16pro-blockperf.rules@@
+UDEV_PERF
+
 # adios is built as a module (CONFIG_MQ_IOSCHED_ADIOS=m) and, unlike bfq, its module has no
 # "<name>-iosched" autoload alias, so the udev rule's ATTR{queue/scheduler}="adios" write
 # silently no-ops when adios is not already loaded (SSD/NVMe then fall back to mq-deadline or
@@ -273,6 +282,101 @@ systemctl enable nuc16pro-servermax-power.service || true
 # This is what actually pushes a wattage/Tau change live on a machine that's
 # already on the target kernel (no kernel change -> no reboot -> service never re-fires).
 systemctl restart nuc16pro-servermax-power.service || true
+
+# Memory policy: multi-size THP mid orders, DAMON proactive reclaim, KSM asserted off.
+# Measured motivation (see the unit for the numbers): with only the 2MB PMD order enabled,
+# 81% of THP faults on this box fell back to 4K pages because a 30GB machine running ~70
+# containers is too fragmented to serve 2MB contiguous allocations. Enabling 16k/32k/64k
+# gave the fault path somewhere to land and produced ~700k successful huge-page allocations
+# in ~10 minutes, 64k succeeding 87.6% of the time.
+install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-mm.service <<'MM_SVC'
+@@FILE:systemd/nuc16pro-servermax-mm.service@@
+MM_SVC
+
+systemctl daemon-reload
+systemctl enable nuc16pro-servermax-mm.service || true
+# restart for the same RemainAfterExit reason as the units above: an already-active oneshot
+# will not re-run ExecStart just because the unit file changed on disk.
+systemctl restart nuc16pro-servermax-mm.service || true
+
+# dm-crypt: bypass the internal read/write workqueues. dm-crypt defaults to queueing crypto
+# work onto an unbound workqueue and, for writes, offloading again to a second thread; on a
+# machine with AES-NI/VAES (this box exposes vaes and uses aes-xts-plain64, so xts(aes) runs
+# in hardware) the crypto itself is far cheaper than that scheduling round-trip, and the
+# queues just add latency and context switches. no-read-workqueue / no-write-workqueue make
+# dm-crypt process requests synchronously instead (crypttab(5), kernel 5.9+, cryptsetup 2.2+).
+# This matters here because the root LV and both data disks are all LUKS, so every container
+# read and write pays the dm-crypt path.
+#
+# Auto-detected, never hardcoded: the loop rewrites whatever crypttab entries the box has, so
+# no UUID or device name from this machine ends up in the repo. Idempotent (skips lines that
+# already carry the flags) and backs up once before the first edit. Applied live with
+# `cryptsetup refresh` where a keyfile is available, which reloads the dm table without
+# unmounting; entries that unlock from the TPM or a passphrase (typically root) just pick the
+# flags up on the next boot. The crypttab edit is what makes it durable, so initramfs is
+# regenerated when the root device's entry changes.
+if [ -f /etc/crypttab ] && command -v cryptsetup >/dev/null 2>&1; then
+  CRYPTTAB_CHANGED=0
+  cp -n /etc/crypttab /etc/crypttab.nuc16pro-servermax.bak 2>/dev/null || true
+  while read -r CT_NAME CT_DEV CT_KEY CT_OPTS; do
+    case "$CT_NAME" in ''|\#*) continue ;; esac
+    [ -n "$CT_OPTS" ] || continue
+    case "$CT_OPTS" in *no-read-workqueue*) continue ;; esac
+    sed -i "s|^\([[:space:]]*$CT_NAME[[:space:]].*\)\$|\1,no-read-workqueue,no-write-workqueue|" /etc/crypttab
+    CRYPTTAB_CHANGED=1
+    # Live-apply where we can unlock non-interactively; harmless if it fails.
+    if [ -n "$CT_KEY" ] && [ "$CT_KEY" != "none" ] && [ -f "$CT_KEY" ]; then
+      cryptsetup refresh --key-file "$CT_KEY" \
+        --perf-no_read_workqueue --perf-no_write_workqueue "$CT_NAME" 2>/dev/null \
+        && echo "dm-crypt: $CT_NAME refreshed live with no_read/no_write_workqueue" \
+        || echo "dm-crypt: $CT_NAME will pick up the flags on next boot"
+    else
+      echo "dm-crypt: $CT_NAME unlocks without a keyfile, flags apply on next boot"
+    fi
+  done < /etc/crypttab
+  if [ "$CRYPTTAB_CHANGED" = 1 ]; then
+    # Root's crypttab entry is consumed from the initramfs, so it has to be rebuilt.
+    command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u >/dev/null 2>&1 || true
+  fi
+fi
+
+# Docker log rotation. The daemon defaults to json-file with NO size limit, so a chatty
+# container can grow a single log file until the filesystem fills - on a box with ~70 of them
+# that is a real availability risk, and the writes land on the LUKS root LV. 50MB x 3
+# compressed caps total log usage at a bounded figure per container. Merged into any existing
+# daemon.json rather than overwriting it, because this box legitimately sets "dns" there.
+# Deliberately NOT restarting dockerd: that would bounce every container. The new limits
+# apply to containers as they are next recreated, and unconditionally after the next reboot.
+# live-restore is set at the same time so a future dockerd restart leaves containers running.
+if [ -d /etc/docker ] && command -v python3 >/dev/null 2>&1; then
+  cp -n /etc/docker/daemon.json /etc/docker/daemon.json.nuc16pro-servermax.bak 2>/dev/null || true
+  python3 - <<'DOCKER_JSON' || echo "docker: daemon.json untouched (parse failure, left as-is)"
+import json, os
+p = "/etc/docker/daemon.json"
+try:
+    d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+d.setdefault("log-driver", "json-file")
+opts = d.get("log-opts") if isinstance(d.get("log-opts"), dict) else {}
+opts.update({"max-size": "50m", "max-file": "3", "compress": "true"})
+d["log-opts"] = opts
+d.setdefault("live-restore", True)
+json.dump(d, open(p, "w"), indent=2)
+DOCKER_JSON
+fi
+
+# bluetoothd on a headless server: it finds nearby devices it can never pair and logs a
+# failure for each one. Measured on this box: 9436 of 10182 journal error lines in a single
+# boot, 93% of the entire error log, which buries anything that actually matters and writes
+# journal to the encrypted root for no reason. No BT peripherals are used on a rack box.
+# Guarded so it is a no-op where bluetooth is not installed, and trivially reversible with
+# `systemctl enable --now bluetooth`.
+if systemctl cat bluetooth.service >/dev/null 2>&1; then
+  systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
+fi
 
 # Headless-server plymouth deadlock: plymouth-quit-wait.service runs `plymouth --wait` with
 # TimeoutStartUSec=infinity and is ordered Before=multi-user.target. On a server with no
@@ -612,7 +716,14 @@ done
 #   server does not need NMI lockup detection. mitigations stays =auto (internet-exposed).
 # splash is stripped below (not re-added): the plymouth splash starves multi-user.target on
 #   this headless box, delaying the tuning oneshots.
-GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
+# zswap.max_pool_percent raised 20 -> 30 (2026-08-23). Measured on this box: 12.77M zswap
+# writeouts against 7.88M readins, i.e. pages are being pushed out and pulled straight back,
+# which is what a pool that is too small to hold the working set looks like. At 20% of 30GB
+# the compressed cache tops out around 6GB and overflow goes to disk swap on the LUKS root;
+# 30% gives it ~9GB before it has to touch the encrypted device. The pool is a ceiling, not a
+# reservation, so it costs nothing when the box is not under memory pressure. Kept at 30 and
+# not higher because page cache on this media server is worth real money too.
+GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=30 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
   CURRENT="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | \

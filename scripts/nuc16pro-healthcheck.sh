@@ -148,5 +148,123 @@ else
   note "docker not present"
 fi
 
+sec memory-tuning
+# multi-size THP. The point of this section is the RATIO, not the absolute counters: if the
+# mid orders regress to "never" the fallback rate climbs back toward the ~81% that was
+# measured before they were enabled, and that is the signal worth catching.
+mthp_on=""
+for o in 16 32 64; do
+  e="/sys/kernel/mm/transparent_hugepage/hugepages-${o}kB/enabled"
+  [ -f "$e" ] || continue
+  case "$(cat "$e")" in *"[always]"*|*"[inherit]"*) mthp_on="$mthp_on ${o}k" ;; esac
+done
+if [ -n "$mthp_on" ]; then
+  note "mTHP orders enabled:$mthp_on"
+else
+  flag "mTHP mid orders (16k/32k/64k) all disabled - THP faults will fall back to 4k (nuc16pro-servermax-mm.service not applied?)"
+fi
+for o in 16 32 64 2048; do
+  s="/sys/kernel/mm/transparent_hugepage/hugepages-${o}kB/stats"
+  [ -d "$s" ] || continue
+  a=$(cat "$s/anon_fault_alloc" 2>/dev/null || echo 0)
+  f=$(cat "$s/anon_fault_fallback" 2>/dev/null || echo 0)
+  t=$((a + f))
+  if [ "$t" -gt 0 ]; then
+    note "mTHP ${o}kB: alloc=$a fallback=$f ($((a * 100 / t))% success)"
+  fi
+done
+# KSM is asserted off on purpose: measured general_profit was NEGATIVE on this box because
+# Docker never opts memory in via MADV_MERGEABLE, so ksmd scans without merging.
+if [ -f /sys/kernel/mm/ksm/run ]; then
+  k=$(cat /sys/kernel/mm/ksm/run)
+  if [ "$k" = "0" ]; then
+    note "KSM: off (intended - measured negative general_profit on this workload)"
+  else
+    p=$(cat /sys/kernel/mm/ksm/general_profit 2>/dev/null || echo n/a)
+    flag "KSM enabled (run=$k, general_profit=$p) - it merged ~15 pages at a net loss when last tested here"
+  fi
+fi
+# DAMON proactive reclaim
+if [ -f /sys/module/damon_reclaim/parameters/enabled ]; then
+  de=$(cat /sys/module/damon_reclaim/parameters/enabled 2>/dev/null || echo '?')
+  if [ "$de" = "Y" ]; then
+    db=$(cat /sys/module/damon_reclaim/parameters/bytes_reclaimed_regions 2>/dev/null || echo 0)
+    dq=$(cat /sys/module/damon_reclaim/parameters/nr_quota_exceeds 2>/dev/null || echo 0)
+    note "DAMON reclaim: enabled, reclaimed=$((db / 1024 / 1024))MiB quota_exceeds=$dq"
+  else
+    note "DAMON reclaim: disabled (enabled=$de)"
+  fi
+fi
+if [ -f /sys/module/zswap/parameters/max_pool_percent ]; then
+  note "zswap pool: $(cat /sys/module/zswap/parameters/max_pool_percent)% compressor=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null)"
+fi
+zo=$(awk '/^zswpout/{o=$2} /^zswpin/{i=$2} END{if (o>0) printf "%d", i*100/o; else printf "0"}' /proc/vmstat)
+note "zswap refault ratio: ${zo}% of writeouts were read back (high = pool under-sized for the working set)"
+
+sec block-perf
+for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
+  [ -d "$d" ] || continue
+  [ "$(cat "$d/queue/rotational" 2>/dev/null)" = "0" ] || continue
+  n=$(basename "$d")
+  w=$(cat "$d/queue/wbt_lat_usec" 2>/dev/null || echo n/a)
+  ra=$(cat "$d/queue/rq_affinity" 2>/dev/null || echo n/a)
+  s=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/queue/scheduler" 2>/dev/null)
+  note "$n: sched=$s wbt_lat_usec=$w rq_affinity=$ra nr_requests=$(cat "$d/queue/nr_requests" 2>/dev/null)"
+  [ "$w" = "0" ] || flag "$n: writeback throttling still on (wbt_lat_usec=$w) - 61-nuc16pro-blockperf.rules not applied?"
+  [ "$ra" = "2" ] || flag "$n: rq_affinity=$ra, expected 2 (complete on submitting CPU)"
+done
+
+sec crypt-perf
+if command -v dmsetup >/dev/null 2>&1; then
+  ct=$(dmsetup table --target crypt 2>/dev/null)
+  if [ -n "$ct" ]; then
+    # Count crypt targets that are missing the workqueue-bypass flags. Every LUKS device on
+    # this box sits under either the root LV or the media disks, so all container I/O pays
+    # the dm-crypt path and the flags are worth asserting.
+    tot=$(printf '%s\n' "$ct" | grep -c 'crypt ')
+    ok=$(printf '%s\n' "$ct" | grep -c 'no_read_workqueue')
+    note "dm-crypt targets with workqueue bypass: $ok/$tot"
+    [ "$ok" -eq "$tot" ] || flag "$((tot - ok)) dm-crypt target(s) still using the internal workqueues (pending reboot, or crypttab not updated)"
+  fi
+fi
+
+sec boot-order
+# The tuning oneshots must land before dockerd starts the container fleet. This regressed
+# silently once already (After=multi-user.target fired at 42.8s while docker started at
+# 19.5s), and nothing else in the system reports it, so it is checked explicitly.
+# The assertion is on the DECLARED ordering, not on this boot's timestamps. Timestamps are
+# reported too, but they cannot be the test: the updater restarts these oneshots on every run
+# (RemainAfterExit means a changed unit file would otherwise never re-apply), and any manual
+# `systemctl restart` also moves them, so a timestamp-based check reports "started after
+# docker" every time the units are legitimately re-run mid-uptime. The declared ordering is
+# the thing that actually determines behaviour at the next boot, and it is what regressed
+# last time.
+dstart=$(systemctl show -p InactiveExitTimestampMonotonic --value docker.service 2>/dev/null)
+for u in nuc16pro-servermax-cpupower.service nuc16pro-servermax-power.service nuc16pro-servermax-mm.service scx_loader.service; do
+  systemctl cat "$u" >/dev/null 2>&1 || continue
+  before=$(systemctl show -p Before --value "$u" 2>/dev/null)
+  case "$before" in
+    *docker.service*) ordering="declares Before=docker.service" ;;
+    *) ordering="" ;;
+  esac
+  if [ -z "$ordering" ]; then
+    flag "$u does not declare Before=docker.service - at the next boot the container fleet will start untuned"
+    continue
+  fi
+  us=$(systemctl show -p InactiveExitTimestampMonotonic --value "$u" 2>/dev/null)
+  if [ -n "$us" ] && [ "$us" -gt 0 ] 2>/dev/null && [ -n "$dstart" ] && [ "$dstart" -gt 0 ] 2>/dev/null && [ "$us" -lt "$dstart" ]; then
+    note "$u: $ordering, applied $(( (dstart - us) / 1000000 ))s before docker this boot"
+  else
+    note "$u: $ordering (re-run since boot, so this boot's timestamp is not the boot-order signal)"
+  fi
+done
+if systemctl cat bluetooth.service >/dev/null 2>&1; then
+  if systemctl is-enabled --quiet bluetooth.service 2>/dev/null; then
+    flag "bluetooth.service enabled on a headless box (it produced 93% of the error log when last measured)"
+  else
+    note "bluetooth: disabled (intended on headless)"
+  fi
+fi
+
 echo "==== summary: warnings=$warn ===="
 exit 0

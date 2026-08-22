@@ -1,6 +1,17 @@
 [Unit]
 Description=NUC 16 Pro ServerMax CPU performance policy (EPP + HWP boost + platform_profile, Panther Lake P/E/LP-E)
-After=multi-user.target
+# Was After=multi-user.target, which measured as a real bug on this box: multi-user.target
+# only became active at 42.8s into boot (it waits on the slowest thing in the graph, here
+# crowdsec-firewall-bouncer at ~10.6s of its own start time), while docker.service started at
+# 19.5s. So ~70 containers spent the first 23 seconds of their life running under the
+# firmware's cold-boot power policy - platform_profile=balanced, EPP=balance_performance,
+# hwp_dynamic_boost=0 - which is exactly the window where the container storm needs turbo the
+# most. Same anti-pattern that used to delay the sched_ext attach until mid-storm.
+# basic.target is late enough that cpufreq/intel_pstate sysfs is fully populated and early
+# enough to beat docker.service (which waits on network-online.target). No cycle: nothing
+# pulled in by basic.target wants docker.
+After=basic.target
+Before=docker.service
 
 [Service]
 Type=oneshot

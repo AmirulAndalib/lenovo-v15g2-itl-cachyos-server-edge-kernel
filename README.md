@@ -1,5 +1,19 @@
 # ASUS NUC 16 Pro, CachyOS ServerMax Kernel
 
+[![kernel build](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/build-cachyos-server.yml/badge.svg)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/build-cachyos-server.yml)
+[![scx build](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/build-scx-schedulers.yml/badge.svg)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/build-scx-schedulers.yml)
+[![version drift](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/version-drift-check.yml/badge.svg)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/version-drift-check.yml)
+[![updater in sync](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/check-kernel-updater-sync.yml/badge.svg)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/actions/workflows/check-kernel-updater-sync.yml)
+
+[![latest release](https://img.shields.io/github/v/release/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel?sort=date&label=latest%20build&color=blue)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/releases/latest)
+[![upstream scx](https://img.shields.io/github/v/release/sched-ext/scx?label=upstream%20scx&color=orange)](https://github.com/sched-ext/scx/releases/latest)
+[![release date](https://img.shields.io/github/release-date/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel?label=built&color=informational)](https://github.com/AmirulAndalib/asus-nuc16pro-cachyos-server-edge-kernel/releases)
+
+The **version drift** badge is the one that matters for a no-pinning pipeline: it goes red when
+the newest kernel release here stops matching kernel.org's latest stable, or when the newest
+scx release here stops matching `sched-ext/scx`'s latest tag. Green means nothing has gone
+stale behind your back. See [`version-drift-check.yml`](.github/workflows/version-drift-check.yml).
+
 Bleeding-edge [CachyOS](https://github.com/CachyOS/linux-cachyos) kernel pipeline for the ASUS NUC 16 Pro (Intel Core Ultra 7 356H / Panther Lake), tuned for AC-powered server/homelab workloads.
 
 Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimized base config.
@@ -35,13 +49,16 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | CPU target             | x86-64-v3 (AVX2, BMI2, FMA, LZCNT)                                          |
 | Timer frequency        | 100 Hz                                                                       |
 | Preemption             | Lazy (throughput lean; RT-class IRQs preempt immediately)                                                        |
-| Transparent Huge Pages | always                                                                       |
+| Transparent Huge Pages | always, **plus multi-size THP (mTHP) orders 16k/32k/64k enabled** (§10)       |
 | TCP congestion         | BBR (mainline)                                                               |
-| I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev + `modules-load.d` (adios is `=m`)                                       |
-| Zswap                  | Enabled (zstd compressor, zsmalloc pool, 20%)                                             |
+| I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev + `modules-load.d` (adios is `=m`)     |
+| Proactive reclaim      | DAMON_RECLAIM, 128MiB/s quota, 60s min_age (§10)                             |
+| KSM                    | Off, deliberately: measured negative `general_profit` here (§10)             |
+| dm-crypt               | `no_read_workqueue` + `no_write_workqueue` on all LUKS devices (§10)          |
+| Zswap                  | Enabled (zstd compressor, zsmalloc pool, **30%**, §10)                        |
 | Async I/O              | io_uring enabled                                                             |
 | Network offload        | TLS kernel offload, XDP sockets                                              |
-| Block layer            | BLK_WBT writeback throttling, NVMe multipath                                 |
+| Block layer            | NVMe multipath; **wbt off + rq_affinity=2 on non-rotational** (§10)           |
 | NVMe power states      | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)       |
 | Network                | 2x 2.5GbE bonded (balance-xor, static LAG; §5); WiFi 7 failover; `rp_filter=2` loose                     |
 | GPU driver             | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback  |
@@ -367,6 +384,118 @@ These appear in the log on this board and are harmless to operation. They are AS
 - `ACPI: thermal: [Firmware Bug]: Invalid critical threshold (-274000)` and `intel-hid ...: failed to enable HID power button`.
 
 The updater does not suppress these; their cause is understood (firmware) and silencing them would hide real future messages.
+
+### 10. ServerMax tuning round 2 (2026-08-23): memory, block, dm-crypt, boot order
+
+Everything in this section was measured on the live box before it was committed. Where a
+candidate did not survive measurement it is listed under "tested and rejected" rather than
+quietly dropped, because the rejections are the more useful half of the record.
+
+#### Multi-size THP (mTHP), the biggest single win
+
+The kernel defaults every anonymous THP order except PMD (2MB) to `never`
+([`transhuge.rst`](https://docs.kernel.org/admin-guide/mm/transhuge.html): *"By default,
+PMD-sized hugepages have enabled=inherit and all other hugepage sizes have
+enabled=never"*). On a 30GB box running ~70 containers with a ~17GB page cache, 2MB
+contiguous allocations mostly cannot be served, and there was no smaller huge-page order to
+fall back to. Measured before the change:
+
+```
+thp_fault_alloc     172801
+thp_fault_fallback 1573192      -> 81% of THP faults degraded to 4k pages
+```
+
+`nuc16pro-servermax-mm.service` enables orders 16k/32k/64k. Re-measured ~10 minutes after:
+
+| order | alloc | fallback | success |
+| ----- | ----- | -------- | ------- |
+| 64kB | 363443 | 51554 | **87.6%** |
+| 16kB | 215758 | 85548 | 71.6% |
+| 32kB | 123649 | 70767 | 63.6% |
+| 2048kB (PMD, unchanged) | 36299 | 152647 | 19.2% |
+
+~700k huge-page allocations succeeded that would otherwise have been 4k pages. Orders
+128k-1024k are left off on purpose: each additional order adds internal fragmentation and
+another rung for the allocator to try and fail on, and they rarely match real allocation
+sizes. PMD keeps `inherit` so it still follows the global `enabled=always`.
+
+Verify: `for d in /sys/kernel/mm/transparent_hugepage/hugepages-*kB; do echo "$(basename $d) $(cat $d/enabled)"; done`
+Revert: `systemctl disable --now nuc16pro-servermax-mm.service` and write `never` back.
+
+#### dm-crypt workqueue bypass
+
+The root LV and both media disks are LUKS, so every container read and write pays the
+dm-crypt path. dm-crypt defaults to handing crypto to an unbound workqueue and offloading
+writes again to a second thread; with hardware AES (this box exposes `vaes`, cipher is
+`aes-xts-plain64`, `xts(aes)` resolves to a VAES/AVX2 driver) the encryption is cheaper than
+that scheduling round-trip. `no-read-workqueue` / `no-write-workqueue`
+([`crypttab(5)`](https://man7.org/linux/man-pages/man5/crypttab.5.html), kernel 5.9+) make
+dm-crypt process requests synchronously instead.
+
+The updater rewrites whatever `crypttab` entries the box has (auto-detected, no UUIDs in this
+repo), applies them live with `cryptsetup refresh` wherever a keyfile exists, and regenerates
+the initramfs for the root entry. Devices unlocked by TPM or passphrase pick the flags up on
+the next boot.
+
+Verify: `sudo dmsetup table --target crypt` should show `no_read_workqueue no_write_workqueue`.
+
+#### Block layer: wbt off, rq_affinity=2
+
+`61-nuc16pro-blockperf.rules` (numbered after the elevator rule, because switching schedulers
+re-initialises wbt). Writing `0` to `wbt_lat_usec` disables writeback throttling; ADIOS
+already does latency-targeted arbitration with its own per-op latency models, so wbt is a
+second, blinder throttle stacked on a smarter one - upstream reached the same conclusion for
+BFQ. `rq_affinity=2` forces completion onto the submitting CPU rather than its cache "group",
+which matters on a hybrid P/E/LP-E part where a group spans cores with different cache and
+clock behaviour. Rotational devices keep wbt.
+
+#### Boot ordering: tuning now lands before dockerd
+
+Measured: `multi-user.target` only went active at **42.8s**, while `docker.service` started at
+**19.5s**. Every unit ordered `After=multi-user.target` - which was both tuning oneshots - was
+therefore applying CPU, NVMe, NIC and thermal policy *23 seconds after* ~70 containers had
+already started, under the firmware's cold-boot power policy. All three tuning units are now
+`After=basic.target` + `Before=docker.service`, the same fix already proven for the sched_ext
+attach. The healthcheck asserts the ordering every boot so this cannot regress silently
+again.
+
+#### Smaller items
+
+- **zswap pool 20% -> 30%**: 12.77M writeouts against 7.88M readins is a pool too small to
+  hold the working set, so pages were being pushed out and pulled straight back off the
+  encrypted root. The pool is a ceiling, not a reservation.
+- **DAMON proactive reclaim** enabled with a 128MiB/s quota, 10ms/s CPU quota and 60s
+  `min_age`. The watermarks are deliberately *not* the documented example values: this box
+  runs at ~1.5% free memory with most of RAM as page cache, so the doc's `wmarks_low=200`
+  would have left DAMON permanently disabled below its own low watermark.
+- **Docker log rotation** (50m x 3, compressed) merged into the existing `daemon.json`. The
+  default json-file driver has no size cap, which on ~70 containers is a real disk-fill risk
+  on the encrypted root. dockerd is deliberately *not* restarted by the updater.
+- **`noatime`** on the two media data disks (box-local `fstab`, not repo-tracked: the mount
+  points and UUIDs are host-specific).
+- **bluetooth disabled**: it produced 9436 of 10182 journal error lines in one boot (93%) on a
+  headless box with no BT peripherals.
+
+#### Tested and rejected
+
+| candidate | verdict |
+| --------- | ------- |
+| **KSM** (kernel samepage merging) | **Rejected on measurement.** Enabled with `advisor_mode=scan-time`; after 436 full scans and 1.6M pages scanned it had merged **15 pages** with `general_profit = -1884032`, i.e. a net *loss* of ~1.8MB. KSM only examines memory a process opted in via `MADV_MERGEABLE`/`PR_SET_MEMORY_MERGE`, and Docker sets neither; container image layers are already shared through the overlayfs page cache. Asserted off so a default flip cannot re-enable it. |
+| **irqbalance** | Not installed. It has no awareness of P/E/LP-E asymmetry, so on this part it can migrate a NIC queue's IRQ onto a low-power core, and it fights the cache locality that `rq_affinity=2` is buying. The kernel's default spread plus `threadirqs` is left in place. |
+| **`nohz_full` / `rcu_nocbs`** | Available in the config (`CONFIG_NO_HZ_FULL=y`, `CONFIG_RCU_NOCB_CPU=y`) and deliberately unused. Both are for pinned, isolated, single-tenant-per-core workloads; on a box with ~70 containers freely scheduled across all 16 cores they cost housekeeping-CPU capacity and gain nothing. |
+| **`mitigations=off`** and per-mitigation opt-outs | Permanently off the table. The box is internet-exposed with published ports. |
+| **`split_lock_mitigate=0`**, `kernel.watchdog=0` | Rejected: the first lets a misbehaving container stall the memory bus for everyone, the second removes hang detection from a machine that is administered remotely. |
+| **RAPL / PL1 / PL2 writes, C-state forcing, `performance` governor pinning** | Unchanged, for the reasons in §6: the 356H is silicon-capped at 80W MTP and light cores releasing power budget is what lets loaded cores turbo. |
+| **scx_flash explicit `server_mode` flags** | Left alone. `config.toml` sets `default_mode = "Server"`, but per the scx_loader schema a mode only means something if a `[scheds.'flash'] server_mode = [...]` array defines flags, so flash currently runs with its own upstream defaults - confirmed by `ps` showing zero arguments. That is a healthy, supported state (attached, `NRestarts=0`), so the mode line is cosmetic rather than broken and the scheduler was not touched. |
+| **Jumbo frames, `busy_poll`, coalescing changes** | Not pursued: WAN-capped upload workload on a 1500-MTU LAN with mixed clients, and `rx-usecs=3` is already the aggressive end. |
+
+#### Currency
+
+Checked against upstream at the time of writing: kernel.org latest stable **7.2** / box running
+**7.2.0**-cachyos-edge, and `sched-ext/scx` latest release **v1.1.3** / box running
+**scx_flash 1.1.3**. Both arrived on the box unattended through the existing pipeline, which is
+the pipeline working as designed. Nothing is pinned; the drift badge at the top of this file is
+the standing check.
 
 ## Manual Build
 

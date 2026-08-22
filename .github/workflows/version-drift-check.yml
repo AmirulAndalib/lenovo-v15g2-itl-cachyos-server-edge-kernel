@@ -1,0 +1,138 @@
+name: Version drift check (kernel + scx vs upstream latest)
+
+# The whole pipeline is built on "always latest, never pinned": the kernel build resolves
+# the current linux-cachyos PKGBUILD and the scx build resolves sched-ext/scx's latest
+# release at build time. Nothing in the repo pins a runtime version. The failure mode that
+# creates is silent staleness - if a build workflow stops firing, or an upstream release
+# lands and nothing rebuilds, the box quietly drifts behind and there is no signal anywhere.
+#
+# This job is that signal. It compares what this repo has actually released against what
+# upstream currently ships, and goes red when they diverge, so the badge in the README is a
+# live statement about currency rather than a claim.
+#
+# A red result right after an upstream release is expected and self-healing: it means
+# upstream moved and the corresponding build workflow has not produced a release yet.
+
+on:
+  schedule:
+    # 06:15 UTC daily. Offset off the hour so it is not competing with everyone else's cron.
+    - cron: '15 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: version-drift-check
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Compare released kernel + scx against upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Resolve upstream and released versions
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          # --- upstream: latest mainline/stable kernel, straight from kernel.org ---------
+          # finger_banner is the canonical plain-text source and has no rate limit or auth.
+          BANNER="$(curl -fsSL --retry 3 --retry-delay 5 https://www.kernel.org/finger_banner)"
+          UPSTREAM_KERNEL="$(printf '%s\n' "$BANNER" \
+            | sed -n 's/^The latest stable version of the Linux kernel is: *//p' \
+            | head -1)"
+          if [ -z "$UPSTREAM_KERNEL" ]; then
+            echo "::error::could not parse the latest stable kernel version from kernel.org/finger_banner"
+            printf '%s\n' "$BANNER"
+            exit 1
+          fi
+
+          # --- upstream: latest sched-ext/scx release -----------------------------------
+          UPSTREAM_SCX="$(gh api repos/sched-ext/scx/releases/latest --jq '.tag_name')"
+          UPSTREAM_SCX_DATE="$(gh api repos/sched-ext/scx/releases/latest --jq '.published_at')"
+
+          # --- ours: newest kernel release and newest scx release in this repo ----------
+          # Kernel releases are tagged vX.Y.Z-cachyos-...; scx releases are tagged scx-vX.Y.Z-...
+          RELEASES="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq '.[] | [.tagName, .createdAt] | @tsv')"
+
+          OURS_KERNEL_TAG="$(printf '%s\n' "$RELEASES" | awk -F'\t' '$1 ~ /^v[0-9]/ {print $1; exit}')"
+          OURS_SCX_TAG="$(printf '%s\n'   "$RELEASES" | awk -F'\t' '$1 ~ /^scx-/   {print $1; exit}')"
+
+          # vX.Y.Z-cachyos-edge-... -> X.Y.Z ; scx-vX.Y.Z-20260819.12 -> v1.1.3
+          OURS_KERNEL="$(printf '%s' "${OURS_KERNEL_TAG:-}" | sed -E 's/^v//; s/-cachyos.*//')"
+          OURS_SCX="$(printf '%s'    "${OURS_SCX_TAG:-}"    | sed -E 's/^scx-(v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+
+          # kernel.org reports a .0 release as "7.2" while our tag carries "7.2.0".
+          # Normalise both to three components before comparing so that is not false drift.
+          norm() { printf '%s' "$1" | awk -F. '{printf "%d.%d.%d", $1, ($2==""?0:$2), ($3==""?0:$3)}'; }
+          UPSTREAM_KERNEL_N="$(norm "$UPSTREAM_KERNEL")"
+          OURS_KERNEL_N="$(norm "${OURS_KERNEL:-0}")"
+
+          {
+            echo "upstream_kernel=$UPSTREAM_KERNEL"
+            echo "upstream_kernel_n=$UPSTREAM_KERNEL_N"
+            echo "ours_kernel=${OURS_KERNEL:-none}"
+            echo "ours_kernel_n=$OURS_KERNEL_N"
+            echo "ours_kernel_tag=${OURS_KERNEL_TAG:-none}"
+            echo "upstream_scx=$UPSTREAM_SCX"
+            echo "upstream_scx_date=$UPSTREAM_SCX_DATE"
+            echo "ours_scx=${OURS_SCX:-none}"
+            echo "ours_scx_tag=${OURS_SCX_TAG:-none}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report and fail on drift
+        run: |
+          set -euo pipefail
+          UK='${{ steps.resolve.outputs.upstream_kernel }}'
+          UKN='${{ steps.resolve.outputs.upstream_kernel_n }}'
+          OK='${{ steps.resolve.outputs.ours_kernel }}'
+          OKN='${{ steps.resolve.outputs.ours_kernel_n }}'
+          OKT='${{ steps.resolve.outputs.ours_kernel_tag }}'
+          US='${{ steps.resolve.outputs.upstream_scx }}'
+          USD='${{ steps.resolve.outputs.upstream_scx_date }}'
+          OS='${{ steps.resolve.outputs.ours_scx }}'
+          OST='${{ steps.resolve.outputs.ours_scx_tag }}'
+
+          drift=0
+          kernel_state='current'
+          scx_state='current'
+          [ "$UKN" = "$OKN" ] || { kernel_state='DRIFT'; drift=1; }
+          [ "$US"  = "$OS"  ] || { scx_state='DRIFT';    drift=1; }
+
+          {
+            echo "## Version currency"
+            echo
+            echo "| component | upstream latest | this repo released | state |"
+            echo "| --- | --- | --- | --- |"
+            echo "| Linux kernel | \`$UK\` | \`$OK\` | $kernel_state |"
+            echo "| sched-ext/scx | \`$US\` | \`$OS\` | $scx_state |"
+            echo
+            echo "Newest kernel release tag: \`$OKT\`"
+            echo "Newest scx release tag: \`$OST\`"
+            echo "Upstream scx published: \`$USD\`"
+            echo
+            if [ "$drift" = 0 ]; then
+              echo "Both components match upstream latest. Nothing pinned, nothing stale."
+            else
+              echo "Drift detected. This is expected for a short window after an upstream"
+              echo "release and clears itself once the matching build workflow publishes a"
+              echo "release. If it persists, the build workflow is not firing - check"
+              echo "\`build-cachyos-server.yml\` and \`build-scx-schedulers.yml\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$drift" != 0 ]; then
+            [ "$kernel_state" = 'current' ] || echo "::error title=Kernel drift::upstream stable is $UK but the newest release here is $OK"
+            [ "$scx_state"    = 'current' ] || echo "::error title=scx drift::upstream latest is $US but the newest release here is $OS"
+            exit 1
+          fi
+          echo "kernel $OK and scx $OS both match upstream latest"

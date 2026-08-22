@@ -1,6 +1,13 @@
 [Unit]
 Description=NUC 16 Pro ServerMax device tuning (BIOS owns power limits and fan curves)
-After=multi-user.target
+# Moved off After=multi-user.target for the same measured reason as the cpupower unit: that
+# target only went active at 42.8s while docker.service started at 19.5s, so the NVMe queue
+# depth, NIC ring sizes and thermal trip points were all still at their defaults while the
+# container fleet was starting. See the cpupower unit for the full timing breakdown.
+# The devices this unit touches (block queues, igc NICs, thermal zones) are all created by
+# udev during sysinit, well before basic.target, so nothing here races an absent sysfs path.
+After=basic.target
+Before=docker.service
 
 [Service]
 Type=oneshot

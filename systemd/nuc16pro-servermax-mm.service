@@ -1,0 +1,76 @@
+[Unit]
+Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders + DAMON proactive reclaim)
+# Ordered like the scx_loader drop-in, NOT After=multi-user.target. The mm policy has to be
+# in place before dockerd forks the container fleet, otherwise ~70 containers fault in their
+# anonymous memory under the old policy and only inherit the new one for later allocations.
+# basic.target is late enough that /sys/kernel/mm is fully populated and the damon_reclaim
+# module parameters exist, and early enough to land ahead of docker.service (which waits on
+# network-online.target). No ordering cycle: nothing in basic.target wants docker.
+After=basic.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# --- multi-size THP (mTHP) ---------------------------------------------------------------
+# Measured on this box: with only the PMD (2MB) order enabled, 81% of THP faults FELL BACK to
+# 4K pages (thp_fault_alloc 172801 vs thp_fault_fallback 1573192) because 30GB of RAM running
+# ~70 containers plus a 14GB page cache is far too fragmented to hand out 2MB contiguous
+# blocks on demand. The kernel defaults every non-PMD order to "never"
+# (Documentation/admin-guide/mm/transhuge.rst: "By default, PMD-sized hugepages have
+# enabled=inherit and all other hugepage sizes have enabled=never"), so those faults had no
+# middle ground to land on.
+#
+# Enabling the mid orders gives the fault path somewhere to go before it gives up on huge
+# pages entirely. Re-measured on this box ~10 minutes after enabling:
+#   64kB  alloc 363443 / fallback  51554  = 87.6% success
+#   16kB  alloc 215758 / fallback  85548  = 71.6% success
+#   32kB  alloc 123649 / fallback  70767  = 63.6% success
+#   2048kB (PMD, unchanged) alloc 36299 / fallback 152647 = 19.2% success
+# ~700k huge-page allocations succeeded that would previously have been 4K pages. Fewer,
+# larger mappings mean fewer page faults and less TLB pressure for the same working set.
+#
+# Only 16k/32k/64k are enabled. 128k-1024k are left at "never" on purpose: they are rarely
+# a natural fit for allocation sizes, and every extra enabled order adds internal
+# fragmentation and another rung for the allocator to try and fail on. The PMD order keeps
+# "inherit" so it continues to follow the global enabled=always.
+ExecStart=/bin/sh -c 'for o in 16 32 64; do e=/sys/kernel/mm/transparent_hugepage/hugepages-$${o}kB/enabled; [ -w "$e" ] && echo always > "$e" || true; done; true'
+# Let the kernel reclaim THPs that are mostly zero-filled instead of pinning the memory.
+# Matters more once the mid orders are live, since there are simply more THPs around.
+ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused ] && echo 1 > /sys/kernel/mm/transparent_hugepage/shrink_underused || true'
+
+# --- KSM: deliberately OFF ---------------------------------------------------------------
+# Tested on this box, not assumed. KSM was enabled with advisor_mode=scan-time and left to
+# run: after 436 full scans and 1.6M pages scanned it had merged FIFTEEN pages, and
+# general_profit read -1884032, i.e. KSM's own metadata cost ~1.8MB MORE than it saved.
+# Reason: KSM only ever looks at memory a process has opted in via madvise(MADV_MERGEABLE)
+# or prctl(PR_SET_MEMORY_MERGE), and Docker/containerd do neither. Containers already share
+# their read-only image layers through the overlayfs page cache, which is where the real
+# duplication would have been. So KSM has nothing to merge here and is pure scan overhead.
+# Asserted off rather than left at the default so a future distro/kernel default flip cannot
+# quietly re-enable a known-negative feature. Re-test with general_profit if the container
+# runtime ever starts setting PR_SET_MEMORY_MERGE.
+ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run || true'
+
+# --- DAMON proactive reclaim -------------------------------------------------------------
+# DAMON_RECLAIM finds pages that have not been accessed for min_age and reclaims them ahead
+# of the LRU, so cold anonymous memory drains into zswap gradually instead of the box hitting
+# a wall and doing a burst of synchronous reclaim. This box is a real candidate: it had
+# 12.8M zswap writeouts against 7.9M readins, i.e. genuine refault churn, not a one-off fill.
+#
+# The watermarks are per-thousand of FREE memory and they are NOT the documentation's example
+# values, on purpose. This box runs at ~15/1000 free (1.5%) with ~17GB of that RAM held as
+# page cache, which is healthy for a media server but means the doc's suggested
+# wmarks_low=200 would put DAMON permanently below its own low watermark and silently
+# disable it. high=1000 / mid=1000 / low=0 keeps it always eligible and lets the quota, not
+# the watermarks, be the throttle.
+#
+# quota_sz=128MiB per quota_reset_interval_ms=1000 caps reclaim at 128MiB/s and quota_ms=10
+# caps DAMON's own CPU to 10ms per second, so a pathological case costs ~1% of one core.
+# min_age=60s means only pages untouched for a full minute are candidates.
+# enabled is written LAST because DAMON latches its parameters when it starts the kdamond.
+ExecStart=-/bin/sh -c 'test -d /sys/module/damon_reclaim/parameters || exit 0; cd /sys/module/damon_reclaim/parameters; echo N > enabled 2>/dev/null || true; echo 60000000 > min_age; echo 10 > quota_ms; echo 134217728 > quota_sz; echo 1000 > quota_reset_interval_ms; echo 1000 > wmarks_high; echo 1000 > wmarks_mid; echo 0 > wmarks_low; echo Y > enabled'
+
+[Install]
+WantedBy=multi-user.target

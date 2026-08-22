@@ -273,6 +273,40 @@ ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="adios"
 UDEV
 
+# Block-layer perf knobs for non-rotational devices: wbt off (ADIOS already arbitrates
+# latency, wbt is a second blind throttle on top of a smarter one) and rq_affinity=2
+# (complete on the submitting CPU, which matters on a hybrid P/E/LP-E part). Numbered 61 so
+# it lands after the elevator has been selected - switching the scheduler re-initialises
+# wbt_lat_usec, so writing it first would be undone.
+install -Dm644 /dev/stdin /etc/udev/rules.d/61-nuc16pro-blockperf.rules <<'UDEV_PERF'
+# NUC 16 Pro ServerMax block-layer performance knobs.
+#
+# Numbered 61 so it runs AFTER 60-nuc16pro-ioschedulers.rules has selected the elevator.
+# Order matters: wbt_lat_usec is re-initialised by the block layer when the scheduler is
+# switched, so disabling it before the "adios" write would just be undone.
+#
+# wbt_lat_usec=0 disables writeback throttling. Per Documentation/block/queue-sysfs.rst,
+# "Writing a value of '0' to the wbt_lat_usec file disables the feature", and blk-wbt exists
+# to stop buffered writeback from starving reads on devices that cannot reorder for
+# themselves. With ADIOS active the elevator is already doing latency-targeted arbitration
+# (it maintains per-op latency models and its own lat_target_read/lat_target_write budgets),
+# so wbt is a second, blind throttle layered on top of a smarter one - upstream reached the
+# same conclusion for BFQ and stopped auto-enabling wbt under it. Left ON for rotational
+# devices, which have no such headroom.
+#
+# rq_affinity=2 forces I/O completion onto the exact CPU that submitted the request instead
+# of merely the same cache "group": per queue-sysfs.rst, "For storage configurations that
+# need to maximize distribution of completion processing setting this option to '2' forces
+# the completion to run on the requesting cpu (bypassing the 'group' aggregation logic)".
+# This box is a hybrid P/E/LP-E part, so a "group" spans cores with different cache
+# topology and clock behaviour; completing on the submitting core keeps the data in the
+# right L2 and stops completion work from being flung onto a low-power core.
+#
+# Both are applied only to non-rotational devices. NVMe first, then SATA/eMMC.
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/rq_affinity}="2"
+ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/rq_affinity}="2"
+UDEV_PERF
+
 # adios is built as a module (CONFIG_MQ_IOSCHED_ADIOS=m) and, unlike bfq, its module has no
 # "<name>-iosched" autoload alias, so the udev rule's ATTR{queue/scheduler}="adios" write
 # silently no-ops when adios is not already loaded (SSD/NVMe then fall back to mq-deadline or
@@ -298,7 +332,18 @@ systemctl mask --now power-profiles-daemon.service 2>/dev/null || true
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-cpupower.service <<'SERVICE'
 [Unit]
 Description=NUC 16 Pro ServerMax CPU performance policy (EPP + HWP boost + platform_profile, Panther Lake P/E/LP-E)
-After=multi-user.target
+# Was After=multi-user.target, which measured as a real bug on this box: multi-user.target
+# only became active at 42.8s into boot (it waits on the slowest thing in the graph, here
+# crowdsec-firewall-bouncer at ~10.6s of its own start time), while docker.service started at
+# 19.5s. So ~70 containers spent the first 23 seconds of their life running under the
+# firmware's cold-boot power policy - platform_profile=balanced, EPP=balance_performance,
+# hwp_dynamic_boost=0 - which is exactly the window where the container storm needs turbo the
+# most. Same anti-pattern that used to delay the sched_ext attach until mid-storm.
+# basic.target is late enough that cpufreq/intel_pstate sysfs is fully populated and early
+# enough to beat docker.service (which waits on network-online.target). No cycle: nothing
+# pulled in by basic.target wants docker.
+After=basic.target
+Before=docker.service
 
 [Service]
 Type=oneshot
@@ -333,7 +378,14 @@ systemctl restart nuc16pro-servermax-cpupower.service || true
 install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-power.service <<'POWER_SVC'
 [Unit]
 Description=NUC 16 Pro ServerMax device tuning (BIOS owns power limits and fan curves)
-After=multi-user.target
+# Moved off After=multi-user.target for the same measured reason as the cpupower unit: that
+# target only went active at 42.8s while docker.service started at 19.5s, so the NVMe queue
+# depth, NIC ring sizes and thermal trip points were all still at their defaults while the
+# container fleet was starting. See the cpupower unit for the full timing breakdown.
+# The devices this unit touches (block queues, igc NICs, thermal zones) are all created by
+# udev during sysinit, well before basic.target, so nothing here races an absent sysfs path.
+After=basic.target
+Before=docker.service
 
 [Service]
 Type=oneshot
@@ -379,6 +431,176 @@ systemctl enable nuc16pro-servermax-power.service || true
 # This is what actually pushes a wattage/Tau change live on a machine that's
 # already on the target kernel (no kernel change -> no reboot -> service never re-fires).
 systemctl restart nuc16pro-servermax-power.service || true
+
+# Memory policy: multi-size THP mid orders, DAMON proactive reclaim, KSM asserted off.
+# Measured motivation (see the unit for the numbers): with only the 2MB PMD order enabled,
+# 81% of THP faults on this box fell back to 4K pages because a 30GB machine running ~70
+# containers is too fragmented to serve 2MB contiguous allocations. Enabling 16k/32k/64k
+# gave the fault path somewhere to land and produced ~700k successful huge-page allocations
+# in ~10 minutes, 64k succeeding 87.6% of the time.
+install -Dm644 /dev/stdin /etc/systemd/system/nuc16pro-servermax-mm.service <<'MM_SVC'
+[Unit]
+Description=NUC 16 Pro ServerMax memory tuning (multi-size THP orders + DAMON proactive reclaim)
+# Ordered like the scx_loader drop-in, NOT After=multi-user.target. The mm policy has to be
+# in place before dockerd forks the container fleet, otherwise ~70 containers fault in their
+# anonymous memory under the old policy and only inherit the new one for later allocations.
+# basic.target is late enough that /sys/kernel/mm is fully populated and the damon_reclaim
+# module parameters exist, and early enough to land ahead of docker.service (which waits on
+# network-online.target). No ordering cycle: nothing in basic.target wants docker.
+After=basic.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# --- multi-size THP (mTHP) ---------------------------------------------------------------
+# Measured on this box: with only the PMD (2MB) order enabled, 81% of THP faults FELL BACK to
+# 4K pages (thp_fault_alloc 172801 vs thp_fault_fallback 1573192) because 30GB of RAM running
+# ~70 containers plus a 14GB page cache is far too fragmented to hand out 2MB contiguous
+# blocks on demand. The kernel defaults every non-PMD order to "never"
+# (Documentation/admin-guide/mm/transhuge.rst: "By default, PMD-sized hugepages have
+# enabled=inherit and all other hugepage sizes have enabled=never"), so those faults had no
+# middle ground to land on.
+#
+# Enabling the mid orders gives the fault path somewhere to go before it gives up on huge
+# pages entirely. Re-measured on this box ~10 minutes after enabling:
+#   64kB  alloc 363443 / fallback  51554  = 87.6% success
+#   16kB  alloc 215758 / fallback  85548  = 71.6% success
+#   32kB  alloc 123649 / fallback  70767  = 63.6% success
+#   2048kB (PMD, unchanged) alloc 36299 / fallback 152647 = 19.2% success
+# ~700k huge-page allocations succeeded that would previously have been 4K pages. Fewer,
+# larger mappings mean fewer page faults and less TLB pressure for the same working set.
+#
+# Only 16k/32k/64k are enabled. 128k-1024k are left at "never" on purpose: they are rarely
+# a natural fit for allocation sizes, and every extra enabled order adds internal
+# fragmentation and another rung for the allocator to try and fail on. The PMD order keeps
+# "inherit" so it continues to follow the global enabled=always.
+ExecStart=/bin/sh -c 'for o in 16 32 64; do e=/sys/kernel/mm/transparent_hugepage/hugepages-$${o}kB/enabled; [ -w "$e" ] && echo always > "$e" || true; done; true'
+# Let the kernel reclaim THPs that are mostly zero-filled instead of pinning the memory.
+# Matters more once the mid orders are live, since there are simply more THPs around.
+ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused ] && echo 1 > /sys/kernel/mm/transparent_hugepage/shrink_underused || true'
+
+# --- KSM: deliberately OFF ---------------------------------------------------------------
+# Tested on this box, not assumed. KSM was enabled with advisor_mode=scan-time and left to
+# run: after 436 full scans and 1.6M pages scanned it had merged FIFTEEN pages, and
+# general_profit read -1884032, i.e. KSM's own metadata cost ~1.8MB MORE than it saved.
+# Reason: KSM only ever looks at memory a process has opted in via madvise(MADV_MERGEABLE)
+# or prctl(PR_SET_MEMORY_MERGE), and Docker/containerd do neither. Containers already share
+# their read-only image layers through the overlayfs page cache, which is where the real
+# duplication would have been. So KSM has nothing to merge here and is pure scan overhead.
+# Asserted off rather than left at the default so a future distro/kernel default flip cannot
+# quietly re-enable a known-negative feature. Re-test with general_profit if the container
+# runtime ever starts setting PR_SET_MEMORY_MERGE.
+ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run || true'
+
+# --- DAMON proactive reclaim -------------------------------------------------------------
+# DAMON_RECLAIM finds pages that have not been accessed for min_age and reclaims them ahead
+# of the LRU, so cold anonymous memory drains into zswap gradually instead of the box hitting
+# a wall and doing a burst of synchronous reclaim. This box is a real candidate: it had
+# 12.8M zswap writeouts against 7.9M readins, i.e. genuine refault churn, not a one-off fill.
+#
+# The watermarks are per-thousand of FREE memory and they are NOT the documentation's example
+# values, on purpose. This box runs at ~15/1000 free (1.5%) with ~17GB of that RAM held as
+# page cache, which is healthy for a media server but means the doc's suggested
+# wmarks_low=200 would put DAMON permanently below its own low watermark and silently
+# disable it. high=1000 / mid=1000 / low=0 keeps it always eligible and lets the quota, not
+# the watermarks, be the throttle.
+#
+# quota_sz=128MiB per quota_reset_interval_ms=1000 caps reclaim at 128MiB/s and quota_ms=10
+# caps DAMON's own CPU to 10ms per second, so a pathological case costs ~1% of one core.
+# min_age=60s means only pages untouched for a full minute are candidates.
+# enabled is written LAST because DAMON latches its parameters when it starts the kdamond.
+ExecStart=-/bin/sh -c 'test -d /sys/module/damon_reclaim/parameters || exit 0; cd /sys/module/damon_reclaim/parameters; echo N > enabled 2>/dev/null || true; echo 60000000 > min_age; echo 10 > quota_ms; echo 134217728 > quota_sz; echo 1000 > quota_reset_interval_ms; echo 1000 > wmarks_high; echo 1000 > wmarks_mid; echo 0 > wmarks_low; echo Y > enabled'
+
+[Install]
+WantedBy=multi-user.target
+MM_SVC
+
+systemctl daemon-reload
+systemctl enable nuc16pro-servermax-mm.service || true
+# restart for the same RemainAfterExit reason as the units above: an already-active oneshot
+# will not re-run ExecStart just because the unit file changed on disk.
+systemctl restart nuc16pro-servermax-mm.service || true
+
+# dm-crypt: bypass the internal read/write workqueues. dm-crypt defaults to queueing crypto
+# work onto an unbound workqueue and, for writes, offloading again to a second thread; on a
+# machine with AES-NI/VAES (this box exposes vaes and uses aes-xts-plain64, so xts(aes) runs
+# in hardware) the crypto itself is far cheaper than that scheduling round-trip, and the
+# queues just add latency and context switches. no-read-workqueue / no-write-workqueue make
+# dm-crypt process requests synchronously instead (crypttab(5), kernel 5.9+, cryptsetup 2.2+).
+# This matters here because the root LV and both data disks are all LUKS, so every container
+# read and write pays the dm-crypt path.
+#
+# Auto-detected, never hardcoded: the loop rewrites whatever crypttab entries the box has, so
+# no UUID or device name from this machine ends up in the repo. Idempotent (skips lines that
+# already carry the flags) and backs up once before the first edit. Applied live with
+# `cryptsetup refresh` where a keyfile is available, which reloads the dm table without
+# unmounting; entries that unlock from the TPM or a passphrase (typically root) just pick the
+# flags up on the next boot. The crypttab edit is what makes it durable, so initramfs is
+# regenerated when the root device's entry changes.
+if [ -f /etc/crypttab ] && command -v cryptsetup >/dev/null 2>&1; then
+  CRYPTTAB_CHANGED=0
+  cp -n /etc/crypttab /etc/crypttab.nuc16pro-servermax.bak 2>/dev/null || true
+  while read -r CT_NAME CT_DEV CT_KEY CT_OPTS; do
+    case "$CT_NAME" in ''|\#*) continue ;; esac
+    [ -n "$CT_OPTS" ] || continue
+    case "$CT_OPTS" in *no-read-workqueue*) continue ;; esac
+    sed -i "s|^\([[:space:]]*$CT_NAME[[:space:]].*\)\$|\1,no-read-workqueue,no-write-workqueue|" /etc/crypttab
+    CRYPTTAB_CHANGED=1
+    # Live-apply where we can unlock non-interactively; harmless if it fails.
+    if [ -n "$CT_KEY" ] && [ "$CT_KEY" != "none" ] && [ -f "$CT_KEY" ]; then
+      cryptsetup refresh --key-file "$CT_KEY" \
+        --perf-no_read_workqueue --perf-no_write_workqueue "$CT_NAME" 2>/dev/null \
+        && echo "dm-crypt: $CT_NAME refreshed live with no_read/no_write_workqueue" \
+        || echo "dm-crypt: $CT_NAME will pick up the flags on next boot"
+    else
+      echo "dm-crypt: $CT_NAME unlocks without a keyfile, flags apply on next boot"
+    fi
+  done < /etc/crypttab
+  if [ "$CRYPTTAB_CHANGED" = 1 ]; then
+    # Root's crypttab entry is consumed from the initramfs, so it has to be rebuilt.
+    command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u >/dev/null 2>&1 || true
+  fi
+fi
+
+# Docker log rotation. The daemon defaults to json-file with NO size limit, so a chatty
+# container can grow a single log file until the filesystem fills - on a box with ~70 of them
+# that is a real availability risk, and the writes land on the LUKS root LV. 50MB x 3
+# compressed caps total log usage at a bounded figure per container. Merged into any existing
+# daemon.json rather than overwriting it, because this box legitimately sets "dns" there.
+# Deliberately NOT restarting dockerd: that would bounce every container. The new limits
+# apply to containers as they are next recreated, and unconditionally after the next reboot.
+# live-restore is set at the same time so a future dockerd restart leaves containers running.
+if [ -d /etc/docker ] && command -v python3 >/dev/null 2>&1; then
+  cp -n /etc/docker/daemon.json /etc/docker/daemon.json.nuc16pro-servermax.bak 2>/dev/null || true
+  python3 - <<'DOCKER_JSON' || echo "docker: daemon.json untouched (parse failure, left as-is)"
+import json, os
+p = "/etc/docker/daemon.json"
+try:
+    d = json.load(open(p)) if os.path.exists(p) and os.path.getsize(p) else {}
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+d.setdefault("log-driver", "json-file")
+opts = d.get("log-opts") if isinstance(d.get("log-opts"), dict) else {}
+opts.update({"max-size": "50m", "max-file": "3", "compress": "true"})
+d["log-opts"] = opts
+d.setdefault("live-restore", True)
+json.dump(d, open(p, "w"), indent=2)
+DOCKER_JSON
+fi
+
+# bluetoothd on a headless server: it finds nearby devices it can never pair and logs a
+# failure for each one. Measured on this box: 9436 of 10182 journal error lines in a single
+# boot, 93% of the entire error log, which buries anything that actually matters and writes
+# journal to the encrypted root for no reason. No BT peripherals are used on a rack box.
+# Guarded so it is a no-op where bluetooth is not installed, and trivially reversible with
+# `systemctl enable --now bluetooth`.
+if systemctl cat bluetooth.service >/dev/null 2>&1; then
+  systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
+fi
 
 # Headless-server plymouth deadlock: plymouth-quit-wait.service runs `plymouth --wait` with
 # TimeoutStartUSec=infinity and is ordered Before=multi-user.target. On a server with no
@@ -839,6 +1061,124 @@ else
   note "docker not present"
 fi
 
+sec memory-tuning
+# multi-size THP. The point of this section is the RATIO, not the absolute counters: if the
+# mid orders regress to "never" the fallback rate climbs back toward the ~81% that was
+# measured before they were enabled, and that is the signal worth catching.
+mthp_on=""
+for o in 16 32 64; do
+  e="/sys/kernel/mm/transparent_hugepage/hugepages-${o}kB/enabled"
+  [ -f "$e" ] || continue
+  case "$(cat "$e")" in *"[always]"*|*"[inherit]"*) mthp_on="$mthp_on ${o}k" ;; esac
+done
+if [ -n "$mthp_on" ]; then
+  note "mTHP orders enabled:$mthp_on"
+else
+  flag "mTHP mid orders (16k/32k/64k) all disabled - THP faults will fall back to 4k (nuc16pro-servermax-mm.service not applied?)"
+fi
+for o in 16 32 64 2048; do
+  s="/sys/kernel/mm/transparent_hugepage/hugepages-${o}kB/stats"
+  [ -d "$s" ] || continue
+  a=$(cat "$s/anon_fault_alloc" 2>/dev/null || echo 0)
+  f=$(cat "$s/anon_fault_fallback" 2>/dev/null || echo 0)
+  t=$((a + f))
+  if [ "$t" -gt 0 ]; then
+    note "mTHP ${o}kB: alloc=$a fallback=$f ($((a * 100 / t))% success)"
+  fi
+done
+# KSM is asserted off on purpose: measured general_profit was NEGATIVE on this box because
+# Docker never opts memory in via MADV_MERGEABLE, so ksmd scans without merging.
+if [ -f /sys/kernel/mm/ksm/run ]; then
+  k=$(cat /sys/kernel/mm/ksm/run)
+  if [ "$k" = "0" ]; then
+    note "KSM: off (intended - measured negative general_profit on this workload)"
+  else
+    p=$(cat /sys/kernel/mm/ksm/general_profit 2>/dev/null || echo n/a)
+    flag "KSM enabled (run=$k, general_profit=$p) - it merged ~15 pages at a net loss when last tested here"
+  fi
+fi
+# DAMON proactive reclaim
+if [ -f /sys/module/damon_reclaim/parameters/enabled ]; then
+  de=$(cat /sys/module/damon_reclaim/parameters/enabled 2>/dev/null || echo '?')
+  if [ "$de" = "Y" ]; then
+    db=$(cat /sys/module/damon_reclaim/parameters/bytes_reclaimed_regions 2>/dev/null || echo 0)
+    dq=$(cat /sys/module/damon_reclaim/parameters/nr_quota_exceeds 2>/dev/null || echo 0)
+    note "DAMON reclaim: enabled, reclaimed=$((db / 1024 / 1024))MiB quota_exceeds=$dq"
+  else
+    note "DAMON reclaim: disabled (enabled=$de)"
+  fi
+fi
+if [ -f /sys/module/zswap/parameters/max_pool_percent ]; then
+  note "zswap pool: $(cat /sys/module/zswap/parameters/max_pool_percent)% compressor=$(cat /sys/module/zswap/parameters/compressor 2>/dev/null)"
+fi
+zo=$(awk '/^zswpout/{o=$2} /^zswpin/{i=$2} END{if (o>0) printf "%d", i*100/o; else printf "0"}' /proc/vmstat)
+note "zswap refault ratio: ${zo}% of writeouts were read back (high = pool under-sized for the working set)"
+
+sec block-perf
+for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
+  [ -d "$d" ] || continue
+  [ "$(cat "$d/queue/rotational" 2>/dev/null)" = "0" ] || continue
+  n=$(basename "$d")
+  w=$(cat "$d/queue/wbt_lat_usec" 2>/dev/null || echo n/a)
+  ra=$(cat "$d/queue/rq_affinity" 2>/dev/null || echo n/a)
+  s=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/queue/scheduler" 2>/dev/null)
+  note "$n: sched=$s wbt_lat_usec=$w rq_affinity=$ra nr_requests=$(cat "$d/queue/nr_requests" 2>/dev/null)"
+  [ "$w" = "0" ] || flag "$n: writeback throttling still on (wbt_lat_usec=$w) - 61-nuc16pro-blockperf.rules not applied?"
+  [ "$ra" = "2" ] || flag "$n: rq_affinity=$ra, expected 2 (complete on submitting CPU)"
+done
+
+sec crypt-perf
+if command -v dmsetup >/dev/null 2>&1; then
+  ct=$(dmsetup table --target crypt 2>/dev/null)
+  if [ -n "$ct" ]; then
+    # Count crypt targets that are missing the workqueue-bypass flags. Every LUKS device on
+    # this box sits under either the root LV or the media disks, so all container I/O pays
+    # the dm-crypt path and the flags are worth asserting.
+    tot=$(printf '%s\n' "$ct" | grep -c 'crypt ')
+    ok=$(printf '%s\n' "$ct" | grep -c 'no_read_workqueue')
+    note "dm-crypt targets with workqueue bypass: $ok/$tot"
+    [ "$ok" -eq "$tot" ] || flag "$((tot - ok)) dm-crypt target(s) still using the internal workqueues (pending reboot, or crypttab not updated)"
+  fi
+fi
+
+sec boot-order
+# The tuning oneshots must land before dockerd starts the container fleet. This regressed
+# silently once already (After=multi-user.target fired at 42.8s while docker started at
+# 19.5s), and nothing else in the system reports it, so it is checked explicitly.
+# The assertion is on the DECLARED ordering, not on this boot's timestamps. Timestamps are
+# reported too, but they cannot be the test: the updater restarts these oneshots on every run
+# (RemainAfterExit means a changed unit file would otherwise never re-apply), and any manual
+# `systemctl restart` also moves them, so a timestamp-based check reports "started after
+# docker" every time the units are legitimately re-run mid-uptime. The declared ordering is
+# the thing that actually determines behaviour at the next boot, and it is what regressed
+# last time.
+dstart=$(systemctl show -p InactiveExitTimestampMonotonic --value docker.service 2>/dev/null)
+for u in nuc16pro-servermax-cpupower.service nuc16pro-servermax-power.service nuc16pro-servermax-mm.service scx_loader.service; do
+  systemctl cat "$u" >/dev/null 2>&1 || continue
+  before=$(systemctl show -p Before --value "$u" 2>/dev/null)
+  case "$before" in
+    *docker.service*) ordering="declares Before=docker.service" ;;
+    *) ordering="" ;;
+  esac
+  if [ -z "$ordering" ]; then
+    flag "$u does not declare Before=docker.service - at the next boot the container fleet will start untuned"
+    continue
+  fi
+  us=$(systemctl show -p InactiveExitTimestampMonotonic --value "$u" 2>/dev/null)
+  if [ -n "$us" ] && [ "$us" -gt 0 ] 2>/dev/null && [ -n "$dstart" ] && [ "$dstart" -gt 0 ] 2>/dev/null && [ "$us" -lt "$dstart" ]; then
+    note "$u: $ordering, applied $(( (dstart - us) / 1000000 ))s before docker this boot"
+  else
+    note "$u: $ordering (re-run since boot, so this boot's timestamp is not the boot-order signal)"
+  fi
+done
+if systemctl cat bluetooth.service >/dev/null 2>&1; then
+  if systemctl is-enabled --quiet bluetooth.service 2>/dev/null; then
+    flag "bluetooth.service enabled on a headless box (it produced 93% of the error log when last measured)"
+  else
+    note "bluetooth: disabled (intended on headless)"
+  fi
+fi
+
 echo "==== summary: warnings=$warn ===="
 exit 0
 HEALTHCHECK
@@ -965,7 +1305,14 @@ done
 #   server does not need NMI lockup detection. mitigations stays =auto (internet-exposed).
 # splash is stripped below (not re-added): the plymouth splash starves multi-user.target on
 #   this headless box, delaying the tuning oneshots.
-GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=20 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
+# zswap.max_pool_percent raised 20 -> 30 (2026-08-23). Measured on this box: 12.77M zswap
+# writeouts against 7.88M readins, i.e. pages are being pushed out and pulled straight back,
+# which is what a pool that is too small to hold the working set looks like. At 20% of 30GB
+# the compressed cache tops out around 6GB and overflow goes to disk swap on the LUKS root;
+# 30% gives it ~9GB before it has to touch the encrypted device. The pool is a ceiling, not a
+# reservation, so it costs nothing when the box is not under memory pressure. Kept at 30 and
+# not higher because page cache on this media server is worth real money too.
+GRUB_CMDLINE_ADD="threadirqs usbcore.autosuspend=-1 nvme_core.default_ps_max_latency_us=0 zswap.enabled=1 zswap.shrinker_enabled=1 zswap.compressor=zstd zswap.max_pool_percent=30 mitigations=auto intel_pstate=active preempt=lazy tsc=reliable nmi_watchdog=0"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
   CURRENT="$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub | \
