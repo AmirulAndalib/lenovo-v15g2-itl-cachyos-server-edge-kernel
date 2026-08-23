@@ -1138,17 +1138,16 @@ for u in nuc16pro-servermax-cpupower.service nuc16pro-servermax-power.service nu
     note "$u: $ordering (re-run since boot, so this boot's timestamp is not the boot-order signal)"
   fi
 done
-# bluetooth MUST stay enabled: Home Assistant uses the adapter (the container runs
-# privileged with net=host and /run/dbus bind-mounted, and talks to hci0 through BlueZ).
-# It is noisy in the journal on a box with no paired peripherals nearby, but that is cosmetic
-# and NOT a reason to disable it. Flag the opposite condition instead - if bluetooth is off,
-# HA's BLE integrations are silently broken.
+# bluetooth is REPORTED ONLY, never flagged in either direction. It is used by Home Assistant
+# for BLE (the container runs privileged with net=host and /run/dbus bind-mounted, reaching
+# hci0 through BlueZ), so it should normally be on - but whether it is on is an operator
+# decision, not a health defect, and this script is a report rather than a policy gate.
+# History worth keeping: bluetoothd produces most of this box's journal error lines (9436 of
+# 10182 in one boot) because it discovers unpairable neighbours. That noise is cosmetic. It was
+# once disabled for that reason, which broke the HA use case, so neither state is warned about
+# here now.
 if systemctl cat bluetooth.service >/dev/null 2>&1; then
-  if systemctl is-enabled --quiet bluetooth.service 2>/dev/null; then
-    note "bluetooth: enabled (required by Home Assistant BLE)"
-  else
-    flag "bluetooth.service is NOT enabled - Home Assistant BLE devices will not work"
-  fi
+  note "bluetooth: $(systemctl is-enabled bluetooth.service 2>/dev/null) / $(systemctl is-active bluetooth.service 2>/dev/null) (used by Home Assistant BLE)"
 fi
 
 echo "==== summary: warnings=$warn ===="

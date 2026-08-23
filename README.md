@@ -29,8 +29,8 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | NPU            | Intel NPU 50 TOPS (`intel_vpu` / IVPU driver, 5th Gen, vpu_50xx firmware)     |
 | Ethernet       | Dual Intel I226-V 2.5GbE (`igc` driver)                                       |
 | WiFi           | Intel Wi-Fi 7 BE211 (`iwlwifi` + `iwlmvm`, 320 MHz, MLO, BT 6.0)             |
-| Storage        | PCIe Gen5 x4 + PCIe Gen4 x4 NVMe                                              |
-| Memory         | DDR5-6400 CSO-DIMM (up to 128 GB)                                             |
+| Storage        | 2x NVMe; measured link: Crucial P310 Gen4 x4, Micron 2200 Gen3 x4 (§11)      |
+| Memory         | DDR5 CSO-DIMM; fitted 2x16GB DDR5-4800 at 4800 MT/s, dual controller (§11)   |
 | Connectivity   | Thunderbolt 4 / USB4 x2, USB 3.2 Gen 2x2 (20 Gbps)                           |
 | Architecture   | x86-64-v3                                                                      |
 | Target OS      | Ubuntu 26.04 LTS (amd64)                                                       |
@@ -385,7 +385,7 @@ These appear in the log on this board and are harmless to operation. They are AS
 
 The updater does not suppress these; their cause is understood (firmware) and silencing them would hide real future messages.
 
-### 10. ServerMax tuning round 2 (2026-08-23): memory, block, dm-crypt, boot order
+### 10. ServerMax tuning round 2 (2026-08-23): memory, dm-crypt, boot order
 
 Everything in this section was measured on the live box before it was committed. Where a
 candidate did not survive measurement it is listed under "tested and rejected" rather than
@@ -479,17 +479,18 @@ again.
 - **zswap pool 20% -> 30%**: 12.77M writeouts against 7.88M readins is a pool too small to
   hold the working set, so pages were being pushed out and pulled straight back off the
   encrypted root. The pool is a ceiling, not a reservation.
-- **DAMON proactive reclaim** enabled with a 128MiB/s quota, 10ms/s CPU quota and 60s
-  `min_age`. The watermarks are deliberately *not* the documented example values: this box
-  runs at ~1.5% free memory with most of RAM as page cache, so the doc's `wmarks_low=200`
-  would have left DAMON permanently disabled below its own low watermark.
-  **Unproven, on purpose honest about it:** `bytes_reclaimed_regions` was still `0` at the
-  last reading, which is consistent with a 60s `min_age` plus monitoring warm-up but equally
-  consistent with it never finding anything worth reclaiming. It is shipped as *enabled*, not
-  as a *win*. The healthcheck prints the reclaimed total every run; if that stays at 0 while
-  the box is still swapping, the honest conclusion is that DAMON adds nothing here and the
-  unit's last `ExecStart` should be dropped. Cost if it does nothing is bounded by the quotas
-  (10ms of CPU per second, worst case).
+- **DAMON proactive reclaim: tried, measured, removed.** It was enabled with a 128MiB/s
+  quota, a 10ms/s CPU quota and 60s `min_age`, with watermarks deliberately set to
+  high=1000/mid=1000/low=0 because this box runs at ~1.5% free memory with most of RAM as page
+  cache, so the documented example `wmarks_low=200` would have parked it below its own low
+  watermark and it would never have run at all. After ~19 hours:
+  `bytes_reclaimed_regions=0`, `nr_reclaimed_regions=0`, while `nr_quota_exceeds=2` proved the
+  kdamond was alive and actually hitting its quota, and the box was still holding 6.6GB of
+  swap. It ran, it cost CPU, and it reclaimed nothing measurable. The reason is that MGLRU
+  (fully enabled at `0x0007`) plus the zswap shrinker already drain cold anon continuously, so
+  nothing survives to 60s idle. DAMON is aimed at bursty latency-sensitive reclaim; a media
+  server that swaps steadily is not that shape. Asserted `N` so a stale module parameter
+  cannot restart it.
 - **Docker log rotation** (50m x 3, compressed) merged into the existing `daemon.json`. The
   default json-file driver has no size cap, which on ~70 containers is a real disk-fill risk
   on the encrypted root. dockerd is deliberately *not* restarted by the updater.
@@ -500,7 +501,8 @@ again.
   with, and disabling it was briefly attempted for that reason. That was wrong: Home Assistant
   uses the adapter for its BLE integrations (the container is privileged, `net=host`, with
   `/run/dbus` bind-mounted, talking to `hci0` via BlueZ). Log noise is cosmetic, a broken smart
-  home is not. The healthcheck now flags bluetooth being *off* rather than on. Note that a
+  home is not. The healthcheck reports bluetooth state and flags neither direction, because
+  whether it is on is an operator decision and not a health defect. Note that a
   plain `systemctl disable` does not survive a reboot here anyway, since systemd presets and
   the bluez postinst re-enable it.
 
@@ -509,7 +511,7 @@ again.
 | candidate | verdict |
 | --------- | ------- |
 | **KSM** (kernel samepage merging) | **Rejected on measurement.** Enabled with `advisor_mode=scan-time`; after 436 full scans and 1.6M pages scanned it had merged **15 pages** with `general_profit = -1884032`, i.e. a net *loss* of ~1.8MB. KSM only examines memory a process opted in via `MADV_MERGEABLE`/`PR_SET_MEMORY_MERGE`, and Docker sets neither; container image layers are already shared through the overlayfs page cache. Asserted off so a default flip cannot re-enable it. |
-| **irqbalance** | Not installed. It has no awareness of P/E/LP-E asymmetry, so on this part it can migrate a NIC queue's IRQ onto a low-power core, and it fights the cache locality that `rq_affinity=2` is buying. The kernel's default spread plus `threadirqs` is left in place. |
+| **irqbalance** | Not installed. It has no awareness of P/E/LP-E asymmetry, so on this part it can migrate a NIC queue's IRQ onto a low-power core. The kernel's default spread plus `threadirqs` is left in place. |
 | **`nohz_full` / `rcu_nocbs`** | Available in the config (`CONFIG_NO_HZ_FULL=y`, `CONFIG_RCU_NOCB_CPU=y`) and deliberately unused. Both are for pinned, isolated, single-tenant-per-core workloads; on a box with ~70 containers freely scheduled across all 16 cores they cost housekeeping-CPU capacity and gain nothing. |
 | **`mitigations=off`** and per-mitigation opt-outs | Permanently off the table. The box is internet-exposed with published ports. |
 | **`split_lock_mitigate=0`**, `kernel.watchdog=0` | Rejected: the first lets a misbehaving container stall the memory bus for everyone, the second removes hang detection from a machine that is administered remotely. |
@@ -524,6 +526,60 @@ Checked against upstream at the time of writing: kernel.org latest stable **7.2*
 **scx_flash 1.1.3**. Both arrived on the box unattended through the existing pipeline, which is
 the pipeline working as designed. Nothing is pinned; the drift badge at the top of this file is
 the standing check.
+
+### 11. Hardware ceiling audit: what is actually maxed, and what cannot be
+
+Read from hardware registers rather than inferred, so this is a factual ledger rather than an
+aspiration. It exists so that a future "max everything out" pass starts from what is already at
+its limit instead of re-litigating it.
+
+| component | measured state | verdict |
+| --------- | -------------- | ------- |
+| CPU | `cpuinfo_max_freq` 4.7GHz == `scaling_max_freq`, `no_turbo=0`, `max_perf_pct=100`, no core capped | **at ceiling** |
+| Instruction set | `avx2` + `avx_vnni`, **no AVX-512 of any kind** | **x86-64-v3 is a hard ceiling**; v4 is impossible on this silicon, never propose it |
+| PCIe | every device negotiates at its full `LnkCap`: Crucial P310 16GT/s x4 (Gen4), Micron 2200 8GT/s x4 (Gen3, the drive's own limit), both I226-V 5GT/s x1 | **at ceiling**, nothing under-negotiating |
+| iGPU (Xe3) | `max_freq` == `rp0_freq` == 2450MHz | **unrestricted** |
+| Memory | 2x16GB DDR5-4800 running at 4800 MT/s on **both** controllers | at these modules' rated max |
+| Ethernet | both ports 2500Mb/s full duplex | I226-V silicon max |
+| USB | root hubs at 20000M/x2 | USB 3.2 Gen2x2 max |
+| Thunderbolt | `domain0` present, nothing attached | n/a |
+| Display | all four DP/HDMI connectors disconnected | headless, nothing to tune |
+| WiFi (BE211) | associated 5GHz ch161 at **80MHz HE (WiFi 6)**, MCS11 NSS2, 1200Mbit tx | **not** at ceiling, but the limit is the AP (WiFi 6, no 6GHz/320MHz) and `wlo1` is failover-only behind bond0 |
+
+Idle cores sitting at 400MHz is the intended power-budget sharing on an 80W-capped part, not a
+fault. One PCIe root port reporting width `x0` is an empty slot, not a defect.
+
+**What is left is physical, not configuration:**
+
+1. **Memory is the real bottleneck.** 30% of zswap writeouts get read back and the box holds
+   several GB of swap. No kernel setting fixes a capacity shortage; larger/faster SODIMMs would
+   outweigh every software change in sections 10 and 11 combined.
+2. **WiFi** needs a WiFi 7 AP to reach 320MHz. It is a failover path, so this is low value.
+3. **The Micron 2200 is a Gen3 drive.** x4 Gen3 is its ceiling; only a newer drive changes it.
+4. **Sustained CPU power** is bounded by the 80W MTP silicon cap and the cooler, both BIOS-owned
+   (§6).
+5. **`mitigations=auto`** stays. Internet-exposed box; this is a security decision, not a
+   missing optimisation.
+
+### 12. Verification discipline (why some of section 10 was withdrawn)
+
+Round two originally shipped four changes on mechanism alone. They were then measured, and two
+did not survive. The rule this establishes for this repo:
+
+**A tuning change stays only if it has a number behind it.** mTHP has per-order allocation
+counters. The dm-crypt flags have a `dmsetup table` line. KSM had `general_profit`, DAMON had
+`bytes_reclaimed_regions`, and the block-layer knobs had an fio A/B; all three of those numbers
+came back negative, zero, or noise, so all three are gone.
+
+Practical notes for benchmarking this specific box:
+
+- There was **no benchmark capability at all** until `fio` was installed. Mechanism-only
+  reasoning is what let two unverifiable changes ship, so measure before claiming.
+- The box idles around load 5 with ~70 containers. **fio deltas under roughly 5% are noise
+  here.** Interleave A/B/A/B so drift cannot favour one side, run at least five pairs, and
+  compare medians as well as means. A single before/after pair is worthless.
+- Hardware ceilings (section 11) come from registers and are deterministic; those do not need
+  repeated sampling, unlike throughput.
 
 ## Manual Build
 
