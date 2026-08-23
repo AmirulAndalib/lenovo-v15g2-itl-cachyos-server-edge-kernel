@@ -209,9 +209,13 @@ for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
   w=$(cat "$d/queue/wbt_lat_usec" 2>/dev/null || echo n/a)
   ra=$(cat "$d/queue/rq_affinity" 2>/dev/null || echo n/a)
   s=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/queue/scheduler" 2>/dev/null)
+  # wbt_lat_usec and rq_affinity are REPORTED, not asserted. Both were set to 0/2 in an
+  # earlier round on mechanism grounds, then benchmarked with fio over 5 interleaved pairs
+  # against the kernel defaults: read 161358 vs 164477 KB/s mean, write 133294 vs 131533,
+  # with per-config spread wider than the difference. No measurable win, so the udev rule
+  # was withdrawn and the kernel defaults are back. Left visible here so a future change
+  # to these values is noticed, but there is nothing to flag.
   note "$n: sched=$s wbt_lat_usec=$w rq_affinity=$ra nr_requests=$(cat "$d/queue/nr_requests" 2>/dev/null)"
-  [ "$w" = "0" ] || flag "$n: writeback throttling still on (wbt_lat_usec=$w) - 61-nuc16pro-blockperf.rules not applied?"
-  [ "$ra" = "2" ] || flag "$n: rq_affinity=$ra, expected 2 (complete on submitting CPU)"
 done
 
 sec crypt-perf
@@ -258,11 +262,16 @@ for u in nuc16pro-servermax-cpupower.service nuc16pro-servermax-power.service nu
     note "$u: $ordering (re-run since boot, so this boot's timestamp is not the boot-order signal)"
   fi
 done
+# bluetooth MUST stay enabled: Home Assistant uses the adapter (the container runs
+# privileged with net=host and /run/dbus bind-mounted, and talks to hci0 through BlueZ).
+# It is noisy in the journal on a box with no paired peripherals nearby, but that is cosmetic
+# and NOT a reason to disable it. Flag the opposite condition instead - if bluetooth is off,
+# HA's BLE integrations are silently broken.
 if systemctl cat bluetooth.service >/dev/null 2>&1; then
   if systemctl is-enabled --quiet bluetooth.service 2>/dev/null; then
-    flag "bluetooth.service enabled on a headless box (it produced 93% of the error log when last measured)"
+    note "bluetooth: enabled (required by Home Assistant BLE)"
   else
-    note "bluetooth: disabled (intended on headless)"
+    flag "bluetooth.service is NOT enabled - Home Assistant BLE devices will not work"
   fi
 fi
 

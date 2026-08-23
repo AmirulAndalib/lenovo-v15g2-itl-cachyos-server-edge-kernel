@@ -52,13 +52,13 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | Transparent Huge Pages | always, **plus multi-size THP (mTHP) orders 16k/32k/64k enabled** (§10)       |
 | TCP congestion         | BBR (mainline)                                                               |
 | I/O scheduler          | ADIOS (SSDs/NVMe), BFQ (HDDs) via udev + `modules-load.d` (adios is `=m`)     |
-| Proactive reclaim      | DAMON_RECLAIM, 128MiB/s quota, 60s min_age (§10)                             |
+| Proactive reclaim      | None: DAMON_RECLAIM tried, reclaimed 0 bytes in 19h, dropped (§10)           |
 | KSM                    | Off, deliberately: measured negative `general_profit` here (§10)             |
 | dm-crypt               | `no_read_workqueue` + `no_write_workqueue` on all LUKS devices (§10)          |
 | Zswap                  | Enabled (zstd compressor, zsmalloc pool, **30%**, §10)                        |
 | Async I/O              | io_uring enabled                                                             |
 | Network offload        | TLS kernel offload, XDP sockets                                              |
-| Block layer            | NVMe multipath; **wbt off + rq_affinity=2 on non-rotational** (§10)           |
+| Block layer            | NVMe multipath; kernel-default wbt + rq_affinity (fio showed no win, §10)    |
 | NVMe power states      | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)       |
 | Network                | 2x 2.5GbE bonded (balance-xor, static LAG; §5); WiFi 7 failover; `rp_filter=2` loose                     |
 | GPU driver             | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback  |
@@ -439,15 +439,30 @@ the next boot.
 
 Verify: `sudo dmsetup table --target crypt` should show `no_read_workqueue no_write_workqueue`.
 
-#### Block layer: wbt off, rq_affinity=2
+#### Block layer: tried wbt off + rq_affinity=2, measured nothing, reverted
 
-`61-nuc16pro-blockperf.rules` (numbered after the elevator rule, because switching schedulers
-re-initialises wbt). Writing `0` to `wbt_lat_usec` disables writeback throttling; ADIOS
-already does latency-targeted arbitration with its own per-op latency models, so wbt is a
-second, blinder throttle stacked on a smarter one - upstream reached the same conclusion for
-BFQ. `rq_affinity=2` forces completion onto the submitting CPU rather than its cache "group",
-which matters on a hybrid P/E/LP-E part where a group spans cores with different cache and
-clock behaviour. Rotational devices keep wbt.
+The mechanism argument was sound: ADIOS already does latency-targeted arbitration with its
+own per-op latency models, so blk-wbt is a second and blinder throttle on top of a smarter
+one (upstream reached the same conclusion for BFQ), and `rq_affinity=2` completes on the
+submitting CPU rather than its cache "group", which should matter on a hybrid part where a
+group spans dissimilar cores.
+
+Then it was actually benchmarked, with `fio` on the NVMe behind the LUKS data disk, five
+interleaved A/B pairs so drift could not favour one side:
+
+| config | READ KB/s mean / median | WRITE KB/s mean / median |
+| ------ | ----------------------- | ------------------------ |
+| wbt=0, rq_affinity=2 | 161358 / 163783 | 133294 / 135919 |
+| kernel defaults | **164477 / 164417** | 131533 / **136501** |
+
+The spread *within* each config was wider than the difference *between* them, and the kernel
+defaults came out marginally ahead on both medians. So the change bought nothing measurable
+on this workload and the udev rule was withdrawn. The defaults are also the better-tested
+path. `nr_requests=1023` and the ADIOS elevator itself are unaffected and stay.
+
+Worth stating plainly: this is what the rest of section 10 would look like if it had been
+wrong. mTHP has counters behind it, the crypt flags have a dm table behind them, and this
+one had only a story, so it went.
 
 #### Boot ordering: tuning now lands before dockerd
 
@@ -480,8 +495,14 @@ again.
   on the encrypted root. dockerd is deliberately *not* restarted by the updater.
 - **`noatime`** on the two media data disks (box-local `fstab`, not repo-tracked: the mount
   points and UUIDs are host-specific).
-- **bluetooth disabled**: it produced 9436 of 10182 journal error lines in one boot (93%) on a
-  headless box with no BT peripherals.
+- **bluetooth stays ENABLED.** It produces the large majority of the journal error lines on
+  this box (9436 of 10182 in one boot) because it keeps finding nearby devices it cannot pair
+  with, and disabling it was briefly attempted for that reason. That was wrong: Home Assistant
+  uses the adapter for its BLE integrations (the container is privileged, `net=host`, with
+  `/run/dbus` bind-mounted, talking to `hci0` via BlueZ). Log noise is cosmetic, a broken smart
+  home is not. The healthcheck now flags bluetooth being *off* rather than on. Note that a
+  plain `systemctl disable` does not survive a reboot here anyway, since systemd presets and
+  the bluez postinst re-enable it.
 
 #### Tested and rejected
 

@@ -273,40 +273,6 @@ ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0"
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="adios"
 UDEV
 
-# Block-layer perf knobs for non-rotational devices: wbt off (ADIOS already arbitrates
-# latency, wbt is a second blind throttle on top of a smarter one) and rq_affinity=2
-# (complete on the submitting CPU, which matters on a hybrid P/E/LP-E part). Numbered 61 so
-# it lands after the elevator has been selected - switching the scheduler re-initialises
-# wbt_lat_usec, so writing it first would be undone.
-install -Dm644 /dev/stdin /etc/udev/rules.d/61-nuc16pro-blockperf.rules <<'UDEV_PERF'
-# NUC 16 Pro ServerMax block-layer performance knobs.
-#
-# Numbered 61 so it runs AFTER 60-nuc16pro-ioschedulers.rules has selected the elevator.
-# Order matters: wbt_lat_usec is re-initialised by the block layer when the scheduler is
-# switched, so disabling it before the "adios" write would just be undone.
-#
-# wbt_lat_usec=0 disables writeback throttling. Per Documentation/block/queue-sysfs.rst,
-# "Writing a value of '0' to the wbt_lat_usec file disables the feature", and blk-wbt exists
-# to stop buffered writeback from starving reads on devices that cannot reorder for
-# themselves. With ADIOS active the elevator is already doing latency-targeted arbitration
-# (it maintains per-op latency models and its own lat_target_read/lat_target_write budgets),
-# so wbt is a second, blind throttle layered on top of a smarter one - upstream reached the
-# same conclusion for BFQ and stopped auto-enabling wbt under it. Left ON for rotational
-# devices, which have no such headroom.
-#
-# rq_affinity=2 forces I/O completion onto the exact CPU that submitted the request instead
-# of merely the same cache "group": per queue-sysfs.rst, "For storage configurations that
-# need to maximize distribution of completion processing setting this option to '2' forces
-# the completion to run on the requesting cpu (bypassing the 'group' aggregation logic)".
-# This box is a hybrid P/E/LP-E part, so a "group" spans cores with different cache
-# topology and clock behaviour; completing on the submitting core keeps the data in the
-# right L2 and stops completion work from being flung onto a low-power core.
-#
-# Both are applied only to non-rotational devices. NVMe first, then SATA/eMMC.
-ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/rq_affinity}="2"
-ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]", ATTR{queue/rotational}=="0", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/rq_affinity}="2"
-UDEV_PERF
-
 # adios is built as a module (CONFIG_MQ_IOSCHED_ADIOS=m) and, unlike bfq, its module has no
 # "<name>-iosched" autoload alias, so the udev rule's ATTR{queue/scheduler}="adios" write
 # silently no-ops when adios is not already loaded (SSD/NVMe then fall back to mq-deadline or
@@ -494,24 +460,25 @@ ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused 
 # runtime ever starts setting PR_SET_MEMORY_MERGE.
 ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run || true'
 
-# --- DAMON proactive reclaim -------------------------------------------------------------
-# DAMON_RECLAIM finds pages that have not been accessed for min_age and reclaims them ahead
-# of the LRU, so cold anonymous memory drains into zswap gradually instead of the box hitting
-# a wall and doing a burst of synchronous reclaim. This box is a real candidate: it had
-# 12.8M zswap writeouts against 7.9M readins, i.e. genuine refault churn, not a one-off fill.
+# --- DAMON proactive reclaim: TRIED, MEASURED, DROPPED -----------------------------------
+# DAMON_RECLAIM was enabled here for ~19 hours with min_age=60s, quota_sz=128MiB/s,
+# quota_ms=10 and always-on watermarks (high=1000 mid=1000 low=0, because this box runs at
+# ~1.5% free with most of RAM as page cache, so the documented example wmarks_low=200 would
+# have parked it below its own low watermark and it would never have run at all).
 #
-# The watermarks are per-thousand of FREE memory and they are NOT the documentation's example
-# values, on purpose. This box runs at ~15/1000 free (1.5%) with ~17GB of that RAM held as
-# page cache, which is healthy for a media server but means the doc's suggested
-# wmarks_low=200 would put DAMON permanently below its own low watermark and silently
-# disable it. high=1000 / mid=1000 / low=0 keeps it always eligible and lets the quota, not
-# the watermarks, be the throttle.
+# Result: bytes_reclaimed_regions=0, nr_reclaimed_regions=0, while nr_quota_exceeds=2 proved
+# the kdamond was alive and actually hitting its quota, and the box was still sitting on
+# 6.6GB of swap with 2.09M zswap writeouts this boot. So it ran, it cost CPU, and it
+# reclaimed nothing measurable. The reason is that there is no idle cold anonymous memory to
+# find: MGLRU (fully enabled, 0x0007) plus the zswap shrinker are already draining cold
+# anon continuously, so by the time a page is 60s idle it has usually been dealt with.
+# DAMON is aimed at workloads where reclaim is bursty and latency-sensitive; a media server
+# that swaps steadily is not that shape.
 #
-# quota_sz=128MiB per quota_reset_interval_ms=1000 caps reclaim at 128MiB/s and quota_ms=10
-# caps DAMON's own CPU to 10ms per second, so a pathological case costs ~1% of one core.
-# min_age=60s means only pages untouched for a full minute are candidates.
-# enabled is written LAST because DAMON latches its parameters when it starts the kdamond.
-ExecStart=-/bin/sh -c 'test -d /sys/module/damon_reclaim/parameters || exit 0; cd /sys/module/damon_reclaim/parameters; echo N > enabled 2>/dev/null || true; echo 60000000 > min_age; echo 10 > quota_ms; echo 134217728 > quota_sz; echo 1000 > quota_reset_interval_ms; echo 1000 > wmarks_high; echo 1000 > wmarks_mid; echo 0 > wmarks_low; echo Y > enabled'
+# Left OFF rather than tuned down further: a shorter min_age would just make it compete with
+# MGLRU for the same pages. Asserted N so a leftover module parameter from an earlier boot
+# cannot silently restart it. Reverting is one line if the workload ever changes shape.
+ExecStart=-/bin/sh -c 'test -w /sys/module/damon_reclaim/parameters/enabled && echo N > /sys/module/damon_reclaim/parameters/enabled || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -598,10 +565,6 @@ fi
 # journal to the encrypted root for no reason. No BT peripherals are used on a rack box.
 # Guarded so it is a no-op where bluetooth is not installed, and trivially reversible with
 # `systemctl enable --now bluetooth`.
-if systemctl cat bluetooth.service >/dev/null 2>&1; then
-  systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
-fi
-
 # Headless-server plymouth deadlock: plymouth-quit-wait.service runs `plymouth --wait` with
 # TimeoutStartUSec=infinity and is ordered Before=multi-user.target. On a server with no
 # graphical/display-manager handoff plymouthd never quits, so the unit blocks forever and
@@ -1122,9 +1085,13 @@ for d in /sys/block/nvme[0-9]n[0-9] /sys/block/sd[a-z]; do
   w=$(cat "$d/queue/wbt_lat_usec" 2>/dev/null || echo n/a)
   ra=$(cat "$d/queue/rq_affinity" 2>/dev/null || echo n/a)
   s=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/queue/scheduler" 2>/dev/null)
+  # wbt_lat_usec and rq_affinity are REPORTED, not asserted. Both were set to 0/2 in an
+  # earlier round on mechanism grounds, then benchmarked with fio over 5 interleaved pairs
+  # against the kernel defaults: read 161358 vs 164477 KB/s mean, write 133294 vs 131533,
+  # with per-config spread wider than the difference. No measurable win, so the udev rule
+  # was withdrawn and the kernel defaults are back. Left visible here so a future change
+  # to these values is noticed, but there is nothing to flag.
   note "$n: sched=$s wbt_lat_usec=$w rq_affinity=$ra nr_requests=$(cat "$d/queue/nr_requests" 2>/dev/null)"
-  [ "$w" = "0" ] || flag "$n: writeback throttling still on (wbt_lat_usec=$w) - 61-nuc16pro-blockperf.rules not applied?"
-  [ "$ra" = "2" ] || flag "$n: rq_affinity=$ra, expected 2 (complete on submitting CPU)"
 done
 
 sec crypt-perf
@@ -1171,11 +1138,16 @@ for u in nuc16pro-servermax-cpupower.service nuc16pro-servermax-power.service nu
     note "$u: $ordering (re-run since boot, so this boot's timestamp is not the boot-order signal)"
   fi
 done
+# bluetooth MUST stay enabled: Home Assistant uses the adapter (the container runs
+# privileged with net=host and /run/dbus bind-mounted, and talks to hci0 through BlueZ).
+# It is noisy in the journal on a box with no paired peripherals nearby, but that is cosmetic
+# and NOT a reason to disable it. Flag the opposite condition instead - if bluetooth is off,
+# HA's BLE integrations are silently broken.
 if systemctl cat bluetooth.service >/dev/null 2>&1; then
   if systemctl is-enabled --quiet bluetooth.service 2>/dev/null; then
-    flag "bluetooth.service enabled on a headless box (it produced 93% of the error log when last measured)"
+    note "bluetooth: enabled (required by Home Assistant BLE)"
   else
-    note "bluetooth: disabled (intended on headless)"
+    flag "bluetooth.service is NOT enabled - Home Assistant BLE devices will not work"
   fi
 fi
 

@@ -53,24 +53,25 @@ ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/transparent_hugepage/shrink_underused 
 # runtime ever starts setting PR_SET_MEMORY_MERGE.
 ExecStart=/bin/sh -c '[ -w /sys/kernel/mm/ksm/run ] && echo 0 > /sys/kernel/mm/ksm/run || true'
 
-# --- DAMON proactive reclaim -------------------------------------------------------------
-# DAMON_RECLAIM finds pages that have not been accessed for min_age and reclaims them ahead
-# of the LRU, so cold anonymous memory drains into zswap gradually instead of the box hitting
-# a wall and doing a burst of synchronous reclaim. This box is a real candidate: it had
-# 12.8M zswap writeouts against 7.9M readins, i.e. genuine refault churn, not a one-off fill.
+# --- DAMON proactive reclaim: TRIED, MEASURED, DROPPED -----------------------------------
+# DAMON_RECLAIM was enabled here for ~19 hours with min_age=60s, quota_sz=128MiB/s,
+# quota_ms=10 and always-on watermarks (high=1000 mid=1000 low=0, because this box runs at
+# ~1.5% free with most of RAM as page cache, so the documented example wmarks_low=200 would
+# have parked it below its own low watermark and it would never have run at all).
 #
-# The watermarks are per-thousand of FREE memory and they are NOT the documentation's example
-# values, on purpose. This box runs at ~15/1000 free (1.5%) with ~17GB of that RAM held as
-# page cache, which is healthy for a media server but means the doc's suggested
-# wmarks_low=200 would put DAMON permanently below its own low watermark and silently
-# disable it. high=1000 / mid=1000 / low=0 keeps it always eligible and lets the quota, not
-# the watermarks, be the throttle.
+# Result: bytes_reclaimed_regions=0, nr_reclaimed_regions=0, while nr_quota_exceeds=2 proved
+# the kdamond was alive and actually hitting its quota, and the box was still sitting on
+# 6.6GB of swap with 2.09M zswap writeouts this boot. So it ran, it cost CPU, and it
+# reclaimed nothing measurable. The reason is that there is no idle cold anonymous memory to
+# find: MGLRU (fully enabled, 0x0007) plus the zswap shrinker are already draining cold
+# anon continuously, so by the time a page is 60s idle it has usually been dealt with.
+# DAMON is aimed at workloads where reclaim is bursty and latency-sensitive; a media server
+# that swaps steadily is not that shape.
 #
-# quota_sz=128MiB per quota_reset_interval_ms=1000 caps reclaim at 128MiB/s and quota_ms=10
-# caps DAMON's own CPU to 10ms per second, so a pathological case costs ~1% of one core.
-# min_age=60s means only pages untouched for a full minute are candidates.
-# enabled is written LAST because DAMON latches its parameters when it starts the kdamond.
-ExecStart=-/bin/sh -c 'test -d /sys/module/damon_reclaim/parameters || exit 0; cd /sys/module/damon_reclaim/parameters; echo N > enabled 2>/dev/null || true; echo 60000000 > min_age; echo 10 > quota_ms; echo 134217728 > quota_sz; echo 1000 > quota_reset_interval_ms; echo 1000 > wmarks_high; echo 1000 > wmarks_mid; echo 0 > wmarks_low; echo Y > enabled'
+# Left OFF rather than tuned down further: a shorter min_age would just make it compete with
+# MGLRU for the same pages. Asserted N so a leftover module parameter from an earlier boot
+# cannot silently restart it. Reverting is one line if the workload ever changes shape.
+ExecStart=-/bin/sh -c 'test -w /sys/module/damon_reclaim/parameters/enabled && echo N > /sys/module/damon_reclaim/parameters/enabled || true'
 
 [Install]
 WantedBy=multi-user.target

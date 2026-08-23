@@ -233,15 +233,6 @@ install -Dm644 /dev/stdin /etc/udev/rules.d/60-nuc16pro-ioschedulers.rules <<'UD
 @@FILE:udev/60-nuc16pro-ioschedulers.rules@@
 UDEV
 
-# Block-layer perf knobs for non-rotational devices: wbt off (ADIOS already arbitrates
-# latency, wbt is a second blind throttle on top of a smarter one) and rq_affinity=2
-# (complete on the submitting CPU, which matters on a hybrid P/E/LP-E part). Numbered 61 so
-# it lands after the elevator has been selected - switching the scheduler re-initialises
-# wbt_lat_usec, so writing it first would be undone.
-install -Dm644 /dev/stdin /etc/udev/rules.d/61-nuc16pro-blockperf.rules <<'UDEV_PERF'
-@@FILE:udev/61-nuc16pro-blockperf.rules@@
-UDEV_PERF
-
 # adios is built as a module (CONFIG_MQ_IOSCHED_ADIOS=m) and, unlike bfq, its module has no
 # "<name>-iosched" autoload alias, so the udev rule's ATTR{queue/scheduler}="adios" write
 # silently no-ops when adios is not already loaded (SSD/NVMe then fall back to mq-deadline or
@@ -374,10 +365,6 @@ fi
 # journal to the encrypted root for no reason. No BT peripherals are used on a rack box.
 # Guarded so it is a no-op where bluetooth is not installed, and trivially reversible with
 # `systemctl enable --now bluetooth`.
-if systemctl cat bluetooth.service >/dev/null 2>&1; then
-  systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
-fi
-
 # Headless-server plymouth deadlock: plymouth-quit-wait.service runs `plymouth --wait` with
 # TimeoutStartUSec=infinity and is ordered Before=multi-user.target. On a server with no
 # graphical/display-manager handoff plymouthd never quits, so the unit blocks forever and
