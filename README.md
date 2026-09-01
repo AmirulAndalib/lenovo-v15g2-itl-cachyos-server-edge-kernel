@@ -62,6 +62,8 @@ Tracks `linux-cachyos-server`, CachyOS stable server variant with server-optimiz
 | NVMe power states      | Disabled (`nvme_core.default_ps_max_latency_us=0`, Gen4/Gen5 max perf)       |
 | Network                | 2x 2.5GbE bonded (balance-xor, static LAG; §5); WiFi 7 failover; `rp_filter=2` loose                     |
 | GPU driver             | `xe` (Intel Xe3 LP Panther Lake, GuC auto-enabled); `i915` kept as fallback  |
+| Vulkan                 | **Software (lavapipe) by design** until Mesa >= 26.1.2; box has 26.0.8 (§13) |
+| VA-API                 | Hardware iHD 26.3.2, 45 profiles; separate stack, unaffected by §13          |
 | IRQ affinity           | `threadirqs`: spread IRQs across P/E/LP-E cores                              |
 | Cgroup v2              | Full stack (CFS_BANDWIDTH, all controllers)                                  |
 | CRIU                   | CHECKPOINT_RESTORE enabled                                                   |
@@ -580,6 +582,90 @@ Practical notes for benchmarking this specific box:
   compare medians as well as means. A single before/after pair is worthless.
 - Hardware ceilings (section 11) come from registers and are deterministic; those do not need
   repeated sampling, unlike throughput.
+
+### 13. Routine checkup 2026-09-01: Vulkan status and the scx "mode" question
+
+Two specific doubts were raised and both were chased to a definite answer.
+
+#### "Vulkan is not hardware" — correct, and it must stay that way for now
+
+The box forces software Vulkan (lavapipe) via `/etc/environment` and a
+`gnome-remote-desktop.service` drop-in, so anything that opens a Vulkan device gets llvmpipe:
+
+```
+driverName = llvmpipe   deviceName = llvmpipe (LLVM 21.1.8, 256 bits)
+```
+
+Forcing the hardware ICD (`/usr/share/vulkan/icd.d/intel_icd.json`) does now enumerate the real
+GPU cleanly, which is a genuine change since the workaround was written:
+
+```
+deviceName = Intel(R) Graphics (PTL)   deviceType = INTEGRATED_GPU
+driverName = Intel open-source Mesa driver   Mesa 26.0.8   ERRORS: 0
+```
+
+**That is not sufficient evidence to remove the workaround, and it was nearly mistaken for it.**
+`vulkaninfo` only enumerates: it creates an instance and queries properties. The July SIGSEGV was
+in `GrdHwAccelVulkan`, on the PipeWire **dmabuf import plus compute color-convert** path, which
+`vulkaninfo` never touches. Enumeration working proves nothing about the path that crashed.
+
+The decisive fact is the Mesa version. The relevant upstream fix, *"ANV: dEQP ASTC tests crash w/
+FPE_INTDIV on Xe3"*, shipped in **Mesa 26.1.2**. This box runs **26.0.8**, and 26.0.8 is the newest
+build Ubuntu resolute offers (`apt-cache policy` shows candidate == installed). So the box does not
+have the Xe3 ANV fixes, and the crash conditions are still present.
+
+Corroborating, and easy to misread: there have been **zero** GRD crashes and zero ANV segfaults this
+boot. That is the workaround doing its job, not evidence the bug is gone. The Intel ICD is never
+loaded, so it cannot crash.
+
+**Verdict: keep the lavapipe pin.** Revisit when Mesa >= 26.1.2 reaches this release. The cost is
+narrow: the RDP colour-convert runs on CPU, H.264 encode stays hardware VAAPI, and VA-API is a
+completely separate stack that is unaffected (45 profiles, iHD 26.3.2 live). Plex, HA, metube and
+convertx transcode through `/dev/dri` on VA-API and never touch Vulkan.
+
+#### `scxctl get` says "with its own defaults" — expected, not a regression
+
+The recollection that it used to say Server mode is half right. The loader *is* applying Server
+mode; the string just reports the argument state. The evidence:
+
+```
+scx_loader[..]: switching Flash with mode Server..
+scx_loader[..]: WARN: switching Flash to Server mode, but no mode-specific
+                arguments are configured; the scheduler will run with its own defaults
+SchedulerMode (DBus property) = 4        # 4 = Server
+/proc/<pid>/cmdline            = "scx_flash"   # no args
+```
+
+So mode selection is working and `config.toml`'s `default_mode = "Server"` is honoured. What is
+absent is a `[scheds.'flash'] server_mode = [...]` array defining *which flags* Server mode should
+pass, so the loader falls through to flash's upstream defaults and says so. Flash is attached with
+`NRestarts=0`; this is a healthy state, and the wording changed because newer scx-loader added that
+explicit warning.
+
+Deliberately not "fixed" by inventing flags. Flash's defaults (`--slice-us 700`,
+`--slice-us-lag 20000`) are upstream's tuned values, and picking different numbers without an A/B
+on this workload would be exactly the mechanism-only change that section 12 exists to prevent.
+
+#### Version mismatch explained
+
+`scxctl`/`scx_loader` report **1.1.2** while `scx_flash` reports **1.1.3**. Not a packaging fault:
+`sched-ext/scx` latest release is v1.1.3, but `sched-ext/scx-loader` is a **separate repository**
+whose newest tag is **v1.1.2**. The build script tries the matching tag and falls back to the
+default branch, so 1.1.2 is the newest loader that exists. Both are current.
+
+#### Everything else
+
+Kernel auto-tracked to **7.2.2**, which kernel.org confirms is the latest stable (7.3 is still
+`-rc1`), and scx is at the latest v1.1.3 — the no-pinning pipeline working unattended again.
+Healthcheck `warnings=0`, 0 failed units, 80 containers 0 unhealthy, 0 throttle events at 73C,
+bond 2/2, dm-crypt 3/3, all four tuning units confirmed applying **before** docker.
+
+mTHP at scale, the headline win, keeps holding: **74.3M** huge-page allocations at 98-99% success
+(16k 22.5M, 32k 13.4M, 64k 38.4M) against PMD's 10%.
+
+One number worth watching: the zswap refault ratio has risen from 30% to **56%**, and swap sits at
+10GB. That is the RAM-capacity ceiling from section 11 asserting itself as the container count grew
+to 80, not a tuning regression. No software setting fixes it.
 
 ## Manual Build
 
